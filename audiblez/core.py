@@ -154,8 +154,7 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
             chapter_wav_files.remove(chapter_wav_path)
 
     if has_ffmpeg:
-        create_index_file(title, creator, chapter_wav_files, output_folder)
-        create_m4b(chapter_wav_files, filename, cover_image, output_folder)
+        create_m4b(chapter_wav_files, filename, cover_image, output_folder, title=title, creator=creator)
         if post_event: post_event('CORE_FINISHED')
 
 
@@ -321,82 +320,112 @@ def strfdelta(tdelta, fmt='{D:02}d {H:02}h {M:02}m {S:02}s'):
     return f.format(fmt, **values)
 
 
-def concat_wavs_with_ffmpeg(chapter_files, output_folder, filename):
-    wav_list_txt = Path(output_folder) / filename.replace('.epub', '_wav_list.txt')
-    with open(wav_list_txt, 'w') as f:
-        for wav_file in chapter_files:
-            f.write(f"file '{wav_file}'\n")
-    concat_file_path = Path(output_folder) / filename.replace('.epub', '.tmp.mp4')
-    subprocess.run([
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', wav_list_txt,
-        # '-c', 'copy',
-        '-c:a',  'libfdk_aac',
-        '-b:a',  '192k',
-        concat_file_path])
-    Path(wav_list_txt).unlink()
-    return concat_file_path
+def _escape_concat_path(path):
+    """Escape a path for ffmpeg's concat demuxer list file (single-quote syntax).
+
+    ffmpeg's concat demuxer wraps each entry as ``file '<path>'``; a literal single
+    quote inside the path must be written as ``'\\''`` (close quote, escaped quote,
+    reopen quote), otherwise paths containing apostrophes break the parse.
+    """
+    return str(path).replace("'", "'\\''")
 
 
-def create_m4b(chapter_files, filename, cover_image, output_folder):
-    concat_file_path = concat_wavs_with_ffmpeg(chapter_files, output_folder, filename)
-    final_filename = Path(output_folder) / filename.replace('.epub', '.m4b')
-    chapters_txt_path = Path(output_folder) / "chapters.txt"
-    print('Creating M4B file...')
+def _escape_ffmetadata(value):
+    """Escape a value for the FFMETADATA1 format.
 
-    if cover_image:
-        cover_file_path = Path(output_folder) / 'cover'
-        with open(cover_file_path, 'wb') as f:
-            f.write(cover_image)
-        cover_image_args = [
-            '-i', f'{cover_file_path}',
-            '-map', '2:v',  # Map cover image
-            '-disposition:v', 'attached_pic',  # Ensure cover is embedded
-            '-c:v', 'copy',  # Keep cover unchanged
-        ]
-    else:
-        cover_image_args = []
-
-    proc = subprocess.run([
-        'ffmpeg',
-        '-y',  # Overwrite output
-        
-        '-i', f'{concat_file_path}',  # Input audio
-        '-i', f'{chapters_txt_path}',  # Input chapters
-        *cover_image_args,  # Cover image (if provided)
-
-        '-map', '0:a',  # Map audio
-        '-c:a', 'aac',  # Convert to AAC
-        '-b:a', '64k',  # Reduce bitrate for smaller size
-
-        '-map_metadata', '1', # Map metadata
-
-        '-f', 'mp4',  # Output as M4B
-        f'{final_filename}'  # Output file
-    ])
-
-    Path(concat_file_path).unlink()
-    if proc.returncode == 0:
-        print(f'{final_filename} created. Enjoy your audiobook.')
-        print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
+    The format is INI-like: ``=``, ``;``, ``#`` and ``\\`` are special and newlines
+    delimit fields. Escaping these prevents untrusted epub title/author metadata from
+    injecting extra fields.
+    """
+    text = str(value)
+    for ch in ('\\', '=', ';', '#'):
+        text = text.replace(ch, '\\' + ch)
+    return text.replace('\r', ' ').replace('\n', ' ')
 
 
 def probe_duration(file_name):
-    args = ['ffprobe', '-i', file_name, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'default=noprint_wrappers=1:nokey=1']
-    proc = subprocess.run(args, capture_output=True, text=True, check=True)
-    return float(proc.stdout.strip())
+    """Return an audio file's duration in seconds, or None if it can't be probed."""
+    args = ['ffprobe', '-i', str(file_name), '-show_entries', 'format=duration',
+            '-v', 'quiet', '-of', 'default=noprint_wrappers=1:nokey=1']
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, check=True)
+        return float(proc.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError) as e:
+        print(f'Warning: could not probe duration of {file_name}: {e}')
+        return None
 
 
-def create_index_file(title, creator, chapter_mp3_files, output_folder):
-    with open(Path(output_folder) / "chapters.txt", "w", encoding="utf-8") as f:
-        f.write(f";FFMETADATA1\ntitle={title}\nartist={creator}\n\n")
+def create_index_file(title, creator, chapter_files, output_folder):
+    """Write an FFMETADATA1 file with sequential, gap-free chapter markers.
+
+    Numbering runs 1..N over the chapters that actually made it into the audiobook,
+    so skipped/empty chapters no longer produce 'Chapter 0' or off-by-one labels.
+    Returns the path to the written file.
+    """
+    chapters_txt_path = Path(output_folder) / "chapters.txt"
+    with open(chapters_txt_path, "w", encoding="utf-8") as f:
+        f.write(f";FFMETADATA1\ntitle={_escape_ffmetadata(title)}\n"
+                f"artist={_escape_ffmetadata(creator)}\n\n")
         start = 0
-        i = 0
-        for c in chapter_mp3_files:
-            duration = probe_duration(c)
-            end = start + (int)(duration * 1000)
+        for i, c in enumerate(chapter_files, start=1):
+            duration = probe_duration(c) or 0.0
+            end = start + int(duration * 1000)
             f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle=Chapter {i}\n\n")
-            i += 1
             start = end
+    return chapters_txt_path
+
+
+def create_m4b(chapter_files, filename, cover_image, output_folder, title='', creator=''):
+    """Create the final .m4b in a SINGLE ffmpeg pass: concat + chapter metadata + cover.
+
+    Fixes several issues with the previous two-pass implementation:
+      - Uses the native 'aac' encoder (present in every ffmpeg build) instead of
+        'libfdk_aac' (absent from standard apt/brew builds), which previously made
+        m4b creation fail for typical users.
+      - Encodes only once (the old code transcoded WAV->192k AAC->64k AAC).
+      - Escapes concat paths so chapter filenames with apostrophes work.
+      - Raises RuntimeError on ffmpeg failure so callers never report a false success
+        over a missing/corrupt output file.
+      - Cleans up temp files via try/finally even when ffmpeg fails.
+    """
+    output_folder = Path(output_folder)
+    final_filename = output_folder / (Path(filename).stem + '.m4b')
+    wav_list_txt = output_folder / (Path(filename).stem + '_wav_list.txt')
+    cover_file_path = None
+    print('Creating M4B file...')
+    try:
+        with open(wav_list_txt, 'w') as f:
+            for wav_file in chapter_files:
+                f.write(f"file '{_escape_concat_path(wav_file)}'\n")
+
+        chapters_txt_path = create_index_file(title, creator, chapter_files, output_folder)
+
+        ffmpeg_args = ['ffmpeg', '-y',
+                       '-f', 'concat', '-safe', '0', '-i', str(wav_list_txt),
+                       '-i', str(chapters_txt_path)]
+        if cover_image:
+            cover_file_path = output_folder / 'cover'
+            with open(cover_file_path, 'wb') as f:
+                f.write(cover_image)
+            ffmpeg_args += ['-i', str(cover_file_path)]
+
+        ffmpeg_args += ['-map', '0:a', '-map_metadata', '1']
+        if cover_file_path:
+            ffmpeg_args += ['-map', '2:v', '-disposition:v', 'attached_pic', '-c:v', 'copy']
+        ffmpeg_args += ['-c:a', 'aac', '-b:a', '64k', '-f', 'mp4', str(final_filename)]
+
+        proc = subprocess.run(ffmpeg_args, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f'ffmpeg failed to create the m4b (exit {proc.returncode}).\n'
+                f'{(proc.stderr or "")[-2000:]}')
+        print(f'{final_filename} created. Enjoy your audiobook.')
+        print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
+        return final_filename
+    finally:
+        for tmp in (wav_list_txt, cover_file_path):
+            if tmp is not None:
+                Path(tmp).unlink(missing_ok=True)
 
 
 def unmark_element(element, stream=None):
