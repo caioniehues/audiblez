@@ -29,6 +29,10 @@ from pick import pick
 sample_rate = 24000
 _nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
 
+MAX_SENTENCE_LENGTH = 400  # chars; Kokoro truncates long non-English sentences, so we split them
+GPU_CHARS_PER_SEC = 500    # rough synthesis throughput, used only for the ETA display
+CPU_CHARS_PER_SEC = 50
+
 
 def to_numpy(audio):
     """Normalise a kokoro audio segment to a 1-D numpy array.
@@ -93,8 +97,18 @@ def set_espeak_library():
         print("On Linux: sudo apt install espeak-ng")
 
 
-def main(file_path, voice, pick_manually, speed, output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None):
+def extract_book_metadata(book):
+    """Return (title, creator) from an ebooklib book's Dublin Core metadata."""
+    meta_title = book.get_metadata('DC', 'title')
+    title = meta_title[0][0] if meta_title else ''
+    meta_creator = book.get_metadata('DC', 'creator')
+    creator = meta_creator[0][0] if meta_creator else ''
+    return title, creator
+
+
+def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_folder: str = '.',
+         max_chapters: int | None = None, max_sentences: int | None = None,
+         selected_chapters: list | None = None, post_event=None) -> None:
     if post_event: post_event('CORE_STARTED')
     load_spacy()
     if output_folder != '.':
@@ -102,12 +116,8 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
 
     filename = Path(file_path).name
 
-    extension = '.epub'
     book = epub.read_epub(file_path)
-    meta_title = book.get_metadata('DC', 'title')
-    title = meta_title[0][0] if meta_title else ''
-    meta_creator = book.get_metadata('DC', 'creator')
-    creator = meta_creator[0][0] if meta_creator else ''
+    title, creator = extract_book_metadata(book)
 
     cover_maybe = find_cover(book)
     cover_image = cover_maybe.get_content() if cover_maybe else b""
@@ -131,7 +141,7 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
     stats = SimpleNamespace(
         total_chars=sum(map(len, texts)),
         processed_chars=0,
-        chars_per_sec=500 if torch.cuda.is_available() else 50)
+        chars_per_sec=GPU_CHARS_PER_SEC if torch.cuda.is_available() else CPU_CHARS_PER_SEC)
     print('Started at:', time.strftime('%H:%M:%S'))
     print(f'Total characters: {stats.total_chars:,}')
     print('Total words:', len(' '.join(texts).split()))
@@ -146,7 +156,7 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
         xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-        chapter_wav_path = Path(output_folder) / filename.replace(extension, f'_chapter_{i}_{voice}_{xhtml_file_name}.wav')
+        chapter_wav_path = Path(output_folder) / f'{Path(filename).stem}_chapter_{i}_{voice}_{xhtml_file_name}.wav'
         chapter_wav_files.append(chapter_wav_path)
         if Path(chapter_wav_path).exists():
             print(f'File for chapter {i} already exists. Skipping')
@@ -210,13 +220,14 @@ def find_cover(book):
 
 def print_selected_chapters(document_chapters, chapters):
     ok = 'X' if platform.system() == 'Windows' else '✅'
+    selected_ids = {id(c) for c in chapters}
     print(tabulate([
-        [i, c.get_name(), len(c.extracted_text), ok if c in chapters else '', chapter_beginning_one_liner(c)]
+        [i, c.get_name(), len(c.extracted_text), ok if id(c) in selected_ids else '', chapter_beginning_one_liner(c)]
         for i, c in enumerate(document_chapters, start=1)
     ], headers=['#', 'Chapter', 'Text Length', 'Selected', 'First words']))
 
-def split_long_sentence(text, max_length=400):
-    """Split a long sentence around the 500 chars, picking the first whitespace after the 500th character. """
+def split_long_sentence(text, max_length=MAX_SENTENCE_LENGTH):
+    """Split a long sentence near max_length chars, breaking at the last whitespace before it."""
     if len(text) <= max_length:
         return [text]
     parts = []
@@ -243,9 +254,9 @@ def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=N
         # For non-english languages, Kokoro truncates long sentences, so we split them manually
         sentences = []
         for sent in list(doc.sents):
-            if len(sent.text) > 400:
+            if len(sent.text) > MAX_SENTENCE_LENGTH:
                 print(f'Warning: Sentence too long ({len(sent.text)} chars), splitting into smaller sentences.')
-                sents = split_long_sentence(sent.text, 400)
+                sents = split_long_sentence(sent.text, MAX_SENTENCE_LENGTH)
                 sentences.extend(sents)
             else:
                 sentences.append(sent.text)
@@ -332,7 +343,8 @@ def pick_chapters(chapters):
     title = 'Select which chapters to read in the audiobook'
     ret = pick(list(chapters_by_names.keys()), title, multiselect=True, min_selection_count=1)
     selected_chapters_out_of_order = [chapters_by_names[r[0]] for r in ret]
-    selected_chapters = [c for c in chapters if c in selected_chapters_out_of_order]
+    selected_ids = {id(c) for c in selected_chapters_out_of_order}
+    selected_chapters = [c for c in chapters if id(c) in selected_ids]
     return selected_chapters
 
 

@@ -132,21 +132,6 @@ class MainWindow(wx.Frame):
         open_epub_button.Bind(wx.EVT_BUTTON, self.on_open)
         top_sizer.Add(open_epub_button, 0, wx.ALL, 5)
 
-        # Open Markdown .md
-        # open_md_button = wx.Button(top_panel, label="📁 Open Markdown (.md)")
-        # open_md_button.Bind(wx.EVT_BUTTON, self.on_open)
-        # top_sizer.Add(open_md_button, 0, wx.ALL, 5)
-
-        # Open .txt
-        # open_txt_button = wx.Button(top_panel, label="📁 Open .txt")
-        # open_txt_button.Bind(wx.EVT_BUTTON, self.on_open)
-        # top_sizer.Add(open_txt_button, 0, wx.ALL, 5)
-
-        # Open PDF
-        # open_pdf_button = wx.Button(top_panel, label="📁 Open PDF")
-        # open_pdf_button.Bind(wx.EVT_BUTTON, self.on_open)
-        # top_sizer.Add(open_pdf_button, 0, wx.ALL, 5)
-
         # About button
         help_button = wx.Button(top_panel, label="ℹ️ About")
         help_button.Bind(wx.EVT_BUTTON, lambda event: self.about_dialog())
@@ -342,12 +327,6 @@ class MainWindow(wx.Frame):
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
         sizer.Add(self.start_button, 0, wx.ALL, 5)
 
-        # Add Stop button
-        # self.stop_button = wx.Button(panel, label="⏹️ Stop Synthesis")
-        # self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
-        # sizer.Add(self.stop_button, 0, wx.ALL, 5)
-        # self.stop_button.Hide()
-
         # Add Progress Bar label:
         self.progress_bar_label = wx.StaticText(panel, label="Synthesis Progress:")
         sizer.Add(self.progress_bar_label, 0, wx.ALL, 5)
@@ -390,20 +369,19 @@ class MainWindow(wx.Frame):
         print(f"Opening file: {file_path}")  # Do something with the filepath (e.g., parse the EPUB)
 
         from ebooklib import epub
-        from audiblez.core import find_document_chapters_and_extract_texts, find_good_chapters, find_cover
+        from audiblez.core import (find_document_chapters_and_extract_texts, find_good_chapters,
+                                   find_cover, extract_book_metadata)
         book = epub.read_epub(file_path)
-        meta_title = book.get_metadata('DC', 'title')
-        self.selected_book_title = meta_title[0][0] if meta_title else ''
-        meta_creator = book.get_metadata('DC', 'creator')
-        self.selected_book_author = meta_creator[0][0] if meta_creator else ''
+        self.selected_book_title, self.selected_book_author = extract_book_metadata(book)
         self.selected_book = book
 
         self.document_chapters = find_document_chapters_and_extract_texts(book)
         good_chapters = find_good_chapters(self.document_chapters)
+        good_ids = {id(c) for c in good_chapters}
         self.selected_chapter = good_chapters[0]
         for chapter in self.document_chapters:
             chapter.short_name = chapter.get_name().replace('.xhtml', '').replace('xhtml/', '').replace('.html', '').replace('Text/', '')
-            chapter.is_selected = chapter in good_chapters
+            chapter.is_selected = id(chapter) in good_ids
 
         self.create_layout_for_ebook(self.splitter)
 
@@ -468,8 +446,9 @@ class MainWindow(wx.Frame):
         table.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_table_unchecked)
         table.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_table_selected)
 
+        good_ids = {id(c) for c in good_chapters}
         for i, chapter in enumerate(self.document_chapters):
-            auto_selected = chapter in good_chapters
+            auto_selected = id(chapter) in good_ids
             table.Append(['', chapter.short_name, f"{len(chapter.extracted_text):,}"])
             if auto_selected: table.CheckItem(i)
 
@@ -547,7 +526,6 @@ class MainWindow(wx.Frame):
                 self.set_table_chapter_status(chapter_index, "Planned")
                 self.table.SetItem(chapter_index, 0, '✔️')
 
-        # self.stop_button.Show()
         print('Starting Audiobook Synthesis', dict(file_path=file_path, voice=voice, pick_manually=False, speed=speed))
         self.core_thread = CoreThread(params=dict(
             file_path=file_path, voice=voice, pick_manually=False, speed=speed,
