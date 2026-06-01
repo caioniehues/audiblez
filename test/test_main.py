@@ -64,3 +64,7 @@ class MainTest(unittest.TestCase):
                 'essa appiccicata, ma anche lontani nel tempo, nello spazio e nel ricordo, con mobili scintillanti e '
                 'strani, con orologi a pendolo di noce e candelabri con piccole foglie di ottone, ma questa volta la '
                 'mia casa buia, dalle cui finestre nevicava all’impazzata, mi è parsa sconfinata.')
+        from audiblez.core import split_long_sentence
+        parts = split_long_sentence(text, 400)
+        self.assertTrue(all(len(p) <= 400 for p in parts))
+        self.assertEqual(' '.join(parts).split(), text.split())

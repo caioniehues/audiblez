@@ -1,57 +1,38 @@
-import os
+"""CLI tests.
+
+`audiblez --help` and the no-arg path do not import the heavy TTS stack (core is
+imported lazily inside cli_main after argument parsing), so these run anywhere the
+package is importable — no models, ffmpeg, or network required. End-to-end epub
+-> m4b conversion is covered by the CI smoke job and test_main.py.
+"""
+import subprocess
+import sys
 import unittest
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-class CliTest(unittest.TestCase):
-    def cli(self, args):
-        cmd = f'cd .. && python -m audiblez.cli {args}'
-        return os.popen(cmd).read()
+def run_cli(*args):
+    return subprocess.run(
+        [sys.executable, '-m', 'audiblez.cli', *args],
+        cwd=REPO_ROOT, capture_output=True, text=True)
 
-    def test_help(self):
-        out = self.cli('--help')
+
+class CliHelpTest(unittest.TestCase):
+    def test_help_lists_voices_and_usage(self):
+        proc = run_cli('--help')
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn('usage:', out)
         self.assertIn('af_sky', out)
+
+    def test_no_args_exits_nonzero_with_usage(self):
+        proc = run_cli()
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
         self.assertIn('usage:', out)
 
-    def test_epub(self):
-        out = self.cli('epub/mini.epub')
-        self.assertIn('Found cover image', out)
-        self.assertIn('Creating M4B file', out)
-        self.assertTrue(Path('../mini.m4b').exists())
-        self.assertTrue(Path('../mini.m4b').stat().st_size > 256 * 1024)
 
-    def test_epub_voice_and_output_folder(self):
-        out = self.cli('epub/mini.epub -v af_sky -o test/prova')
-        self.assertIn('Found cover image', out)
-        self.assertIn('Creating M4B file', out)
-        self.assertTrue(Path('./prova/mini.m4b').exists())
-        self.assertTrue(Path('./prova/mini.m4b').stat().st_size > 256 * 1024)
-
-    @unittest.skip('Not implemented yet')
-    def test_md(self):
-        content = (
-            '## Italy\n'
-            'Italy, officially the Italian Republic, is a country in '
-            '(Southern)[https://en.wikipedia.org/wiki/Southern_Europe] and Western Europe. '
-            'It consists of a peninsula that extends into the Mediterranean Sea, '
-            'with the Alps on its northern land border, '
-            'as well as nearly 800 islands, notably Sicily and Sardinia.')
-        file_name = NamedTemporaryFile('w', suffix='.txt', delete=False).write(content)
-        out = self.cli(file_name)
-        self.assertIn('Creating M4B file', out)
-        self.assertTrue(Path(file_name).exists())
-        self.assertTrue(Path('file_name').stat().st_size > 256 * 1024)
-
-    @unittest.skip('Not implemented yet')
-    def test_txt(self):
-        content = (
-            'Italy, officially the Italian Republic, is a country in Southern and Western Europe. '
-            'It consists of a peninsula that extends into the Mediterranean Sea, '
-            'with the Alps on its northern land border, '
-            'as well as nearly 800 islands, notably Sicily and Sardinia.')
-        file_name = NamedTemporaryFile('w', suffix='.txt', delete=False).write(content)
-        out = self.cli(file_name)
-        self.assertIn('Creating M4B file', out)
-        self.assertTrue(Path('text.mp4').exists())
-        self.assertTrue(Path('text.mp4').stat().st_size > 256 * 1024)
+if __name__ == '__main__':
+    unittest.main()
