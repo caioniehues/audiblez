@@ -84,7 +84,6 @@ class MainWindow(wx.Frame):
     def on_core_chapter_finished(self, event):
         # print('CORE_CHAPTER_FINISHED', event.chapter_index)
         self.set_table_chapter_status(event.chapter_index, "✅ Done")
-        self.start_button.Show()
 
     def on_core_progress(self, event):
         # print('CORE_PROGRESS', event.progress)
@@ -95,6 +94,12 @@ class MainWindow(wx.Frame):
 
     def on_core_finished(self, event):
         self.synthesis_in_progress = False
+        # Re-enable the controls disabled in on_start so another book can be generated.
+        self.start_button.Enable()
+        self.start_button.Show()
+        self.params_panel.Enable()
+        self.table.EnableCheckBoxes(True)
+        self.synth_panel.Layout()
         self.open_folder_with_explorer(self.output_folder_text_ctrl.GetValue())
 
     def create_layout(self):
@@ -369,7 +374,10 @@ class MainWindow(wx.Frame):
         self.selected_voice = event.GetString()
 
     def on_select_speed(self, event):
-        speed = float(event.GetString())
+        try:
+            speed = float(event.GetString())
+        except ValueError:
+            return  # ignore transient/invalid input; keep the last valid speed
         print('Selected speed', speed)
         self.selected_speed = speed
 
@@ -403,7 +411,7 @@ class MainWindow(wx.Frame):
         cover = find_cover(book)
         if cover is not None:
             pil_image = Image.open(io.BytesIO(cover.content))
-            wx_img = wx.EmptyImage(pil_image.size[0], pil_image.size[1])
+            wx_img = wx.Image(pil_image.size[0], pil_image.size[1])
             wx_img.SetData(pil_image.convert("RGB").tobytes())
             cover_h = 200
             cover_w = int(cover_h * pil_image.size[0] / pil_image.size[1])
@@ -477,36 +485,50 @@ class MainWindow(wx.Frame):
         return float(self.selected_speed)
 
     def on_preview_chapter(self, event):
-        lang_code = self.get_selected_voice()[0]
         button = event.GetEventObject()
+        text = self.selected_chapter.extracted_text[:300]
+        if len(text.strip()) == 0:
+            return
+        voice = self.get_selected_voice()
+        speed = self.get_selected_speed()
+        lang_code = voice[0]
         button.SetLabel("⏳")
         button.Disable()
 
-        def generate_preview():
-            import audiblez.core as core
-            from kokoro import KPipeline
-            pipeline = KPipeline(lang_code=lang_code)
-            core.load_spacy()
-            text = self.selected_chapter.extracted_text[:300]
-            if len(text) == 0: return
-            audio_segments = core.gen_audio_segments(
-                pipeline,
-                text,
-                voice=self.get_selected_voice(),
-                speed=self.get_selected_speed())
-            final_audio = np.concatenate(audio_segments)
-            tmp_preview_wav_file = NamedTemporaryFile(suffix='.wav', delete=False)
-            soundfile.write(tmp_preview_wav_file, final_audio, core.sample_rate)
-            cmd = ['ffplay', '-autoexit', '-nodisp', tmp_preview_wav_file.name]
-            subprocess.run(cmd)
+        def restore_button():
             button.SetLabel("🔊 Preview")
             button.Enable()
 
-        if len(self.preview_threads) > 0:
-            for thread in self.preview_threads:
-                thread.join()
-            self.preview_threads = []
-        thread = threading.Thread(target=generate_preview)
+        def generate_preview():
+            tmp_path = None
+            try:
+                import audiblez.core as core
+                from kokoro import KPipeline
+                pipeline = KPipeline(lang_code=lang_code)
+                core.load_spacy()
+                audio_segments = core.gen_audio_segments(pipeline, text, voice=voice, speed=speed)
+                if not audio_segments:
+                    return
+                final_audio = np.concatenate(audio_segments)
+                with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                    tmp_path = tmp.name
+                    soundfile.write(tmp, final_audio, core.sample_rate)
+                subprocess.run(['ffplay', '-autoexit', '-nodisp', tmp_path])
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                # GUI mutations must run on the main thread.
+                wx.CallAfter(restore_button)
+
+        # Drop finished threads; never join() on the UI thread (it freezes the GUI).
+        self.preview_threads = [t for t in self.preview_threads if t.is_alive()]
+        thread = threading.Thread(target=generate_preview, daemon=True)
         thread.start()
         self.preview_threads.append(thread)
 
@@ -571,8 +593,21 @@ class CoreThread(threading.Thread):
         self.params = params
 
     def run(self):
-        import core
-        core.main(**self.params, post_event=self.post_event)
+        from audiblez.core import main
+        try:
+            main(**self.params, post_event=self.post_event)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+
+            def show_error():
+                win = wx.GetApp().GetTopWindow()
+                win.synthesis_in_progress = False
+                win.start_button.Enable()
+                win.params_panel.Enable()
+                wx.MessageBox(f"Audiobook generation failed:\n{e}", "Audiblez Error")
+
+            wx.CallAfter(show_error)
 
     def post_event(self, event_name, **kwargs):
         # eg. 'EVENT_CORE_PROGRESS' -> EventCoreProgress, EVENT_CORE_PROGRESS
