@@ -56,7 +56,7 @@ You need some extra dependencies to run the GUI:
 sudo apt install ffmpeg espeak-ng 
 sudo apt install libgtk-3-dev        # just for Ubuntu/Debian 🐧, Windows/Mac don't need this
   
-pip install audiblez pillow wxpython
+pip install "audiblez[ui]"
 ```
 
 Then you can run the GUI with:
@@ -73,7 +73,7 @@ After many trials, on Windows we recommend to install audiblez in a Python venv:
 3. Enter the folder: `cd audiblez`
 4. Create a venv: `python -m venv venv`
 5. Activate the venv: `.\venv\Scripts\Activate.ps1`
-6. Install the dependencies: `pip install audiblez pillow wxpython`
+6. Install the dependencies: `pip install "audiblez[ui]"`
 7. Now you can run `audiblez` or `audiblez-ui`
 8. For Cuda support, you need to install Pytorch accordingly: https://pytorch.org/get-started/locally/
 
