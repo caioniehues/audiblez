@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import platform
 import re
-from io import StringIO
 from types import SimpleNamespace
 from tabulate import tabulate
 from pathlib import Path
@@ -28,12 +27,37 @@ from ebooklib import epub
 from pick import pick
 
 sample_rate = 24000
+_nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
+
+
+def to_numpy(audio):
+    """Normalise a kokoro audio segment to a 1-D numpy array.
+
+    Depending on version/device kokoro may yield a torch.Tensor (possibly on GPU)
+    or a numpy array; this handles both so np.concatenate / soundfile.write work.
+    """
+    if hasattr(audio, 'detach'):  # torch.Tensor
+        return audio.detach().cpu().numpy()
+    return np.asarray(audio)
 
 
 def load_spacy():
-    if not spacy.util.is_package("xx_ent_wiki_sm"):
-        print("Downloading Spacy model xx_ent_wiki_sm...")
-        spacy.cli.download("xx_ent_wiki_sm")
+    """Load (once) and cache the multilingual spaCy model used for sentence splitting.
+
+    xx_ent_wiki_sm has no sentence boundaries on its own, so a 'sentencizer' is
+    added the first time the model is loaded (guarded in case a future model ships
+    one). Caching at module level avoids reloading the model from disk for every
+    chapter and preview, which was a major performance drain.
+    """
+    global _nlp
+    if _nlp is None:
+        if not spacy.util.is_package("xx_ent_wiki_sm"):
+            print("Downloading Spacy model xx_ent_wiki_sm...")
+            spacy.cli.download("xx_ent_wiki_sm")
+        _nlp = spacy.load("xx_ent_wiki_sm")
+        if "sentencizer" not in _nlp.pipe_names:
+            _nlp.add_pipe("sentencizer")
+    return _nlp
 
 
 def set_espeak_library():
@@ -114,9 +138,10 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
     set_espeak_library()
-    pipeline = KPipeline(lang_code=voice[0])  # a for american or b for british etc.
+    pipeline = KPipeline(lang_code=voice[0], repo_id='hexgrad/Kokoro-82M')  # a=american, b=british, ...
 
     chapter_wav_files = []
+    intro_added = False
     for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
@@ -133,9 +158,11 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
             print(f'Skipping empty chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
             continue
-        if i == 1:
-            # add intro text
+        if not intro_added:
+            # Prepend the book intro to the first chapter actually synthesized
+            # (not necessarily i == 1, which may have been skipped or empty).
             text = f'{title} – {creator}.\n\n' + text
+            intro_added = True
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
@@ -205,8 +232,7 @@ def split_long_sentence(text, max_length=400):
 
 
 def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None):
-    nlp = spacy.load('xx_ent_wiki_sm')
-    nlp.add_pipe('sentencizer')
+    nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
     lang_code = voice[0]
@@ -225,9 +251,9 @@ def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=N
                 sentences.append(sent.text)
 
     for i, sent_text in enumerate(sentences):
-        if max_sentences and i > max_sentences: break
+        if max_sentences and i >= max_sentences: break
         for gs, ps, audio in pipeline(sent_text, voice=voice, speed=speed, split_pattern=r'\n\n\n'):
-            audio_segments.append(audio)
+            audio_segments.append(to_numpy(audio))
         if stats:
             stats.processed_chars += len(sent_text)
             stats.progress = stats.processed_chars * 100 // stats.total_chars
@@ -242,7 +268,10 @@ def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False
     lang_code = voice[:1]
     pipeline = KPipeline(lang_code=lang_code, repo_id='hexgrad/Kokoro-82M')
     load_spacy()
-    audio_segments = gen_audio_segments(pipeline, text, voice=voice, speed=speed);
+    audio_segments = gen_audio_segments(pipeline, text, voice=voice, speed=speed)
+    if not audio_segments:
+        print('Warning: no audio generated for the given text.')
+        return
     final_audio = np.concatenate(audio_segments)
     soundfile.write(output_file, final_audio, sample_rate)
     if play:
@@ -426,24 +455,3 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, title='', cr
         for tmp in (wav_list_txt, cover_file_path):
             if tmp is not None:
                 Path(tmp).unlink(missing_ok=True)
-
-
-def unmark_element(element, stream=None):
-    """auxiliarry function to unmark markdown text"""
-    if stream is None:
-        stream = StringIO()
-    if element.text:
-        stream.write(element.text)
-    for sub in element:
-        unmark_element(sub, stream)
-    if element.tail:
-        stream.write(element.tail)
-    return stream.getvalue()
-
-
-def unmark(text):
-    """Unmark markdown text"""
-    Markdown.output_formats["plain"] = unmark_element  # patching Markdown
-    __md = Markdown(output_format="plain")
-    __md.stripTopLevelTags = False
-    return __md.convert(text)
