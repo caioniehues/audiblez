@@ -4,6 +4,7 @@
 # Kokoro-82M model for high-quality text-to-speech synthesis.
 # by Claudio Santini 2025 - https://claudio.uk
 import os
+import sys
 import traceback
 from glob import glob
 
@@ -115,7 +116,8 @@ def extract_book_metadata(book):
 
 def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_folder: str = '.',
          max_chapters: int | None = None, max_sentences: int | None = None,
-         selected_chapters: list | None = None, backend: str = 'cpu', post_event=None) -> None:
+         selected_chapters: list | None = None, backend: str = 'cpu', post_event=None,
+         chapter_text_dir=None) -> None:
     if post_event: post_event('CORE_STARTED')
     load_spacy()
     if output_folder != '.':
@@ -139,6 +141,19 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         else:
             selected_chapters = find_good_chapters(document_chapters)
     print_selected_chapters(document_chapters, selected_chapters)
+
+    if chapter_text_dir is not None:
+        # Optional override: replace a selected chapter's extracted text with the contents
+        # of '{chapter_text_dir}/chapter_{i}.txt' when that file exists (i is the 1-based
+        # index into selected_chapters, matching the synthesis loop below). Lets callers
+        # hand-edit/pre-process chapter text before narration. Done before `texts`/stats so
+        # totals and the ETA reflect the overridden content.
+        for i, chapter in enumerate(selected_chapters, start=1):
+            override_path = Path(chapter_text_dir) / f'chapter_{i}.txt'
+            if override_path.exists():
+                chapter.extracted_text = override_path.read_text(encoding='utf-8')
+                print(f'Overriding chapter {i} text from {override_path}')
+
     texts = [c.extracted_text for c in selected_chapters]
 
     has_ffmpeg = shutil.which('ffmpeg') is not None
@@ -156,6 +171,9 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
     set_espeak_library()
     synth = build_synthesizer(voice, backend)
+    # Resolve the spec's language code once for the whole run and thread it into each
+    # gen_audio_segments call, instead of re-parsing the spec per chapter.
+    lang_code = voicelib.voice_lang_code(voice)
 
     chapter_wav_files = []
     intro_added = False
@@ -190,7 +208,8 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
-            synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
+            synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences,
+            lang_code=lang_code)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -209,8 +228,12 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     elif has_ffmpeg:
         create_m4b(chapter_wav_files, filename, cover_image, output_folder, title=title, creator=creator)
     else:
-        print('\033[91m' + 'Skipping m4b creation (ffmpeg not found). Your .wav chapter files are in the '
-              'output folder; install ffmpeg to assemble them into an .m4b.' + '\033[0m')
+        # Only wrap in ANSI red when writing to a real terminal — a non-tty (log file,
+        # pipe) or a legacy Windows console without VT support would otherwise show raw
+        # escape codes.
+        msg = ('Skipping m4b creation (ffmpeg not found). Your .wav chapter files are in the '
+               'output folder; install ffmpeg to assemble them into an .m4b.')
+        print(f'\033[91m{msg}\033[0m' if sys.stdout.isatty() else msg)
     # Always emit the terminal event, even when m4b creation was skipped — otherwise the GUI hangs forever
     # waiting on CORE_FINISHED. The .wav chapter files are still a valid result.
     if post_event: post_event('CORE_FINISHED')
@@ -263,6 +286,20 @@ def split_long_sentence(text, max_length=MAX_SENTENCE_LENGTH):
     return parts
 
 
+def _kokoro_voice_string_from_comps(comps):
+    """Engine-ready voice string from already-parsed (voice_id, weight) components.
+
+    Same comma-repetition encoding as :func:`audiblez.voices.kokoro_voice_string`, but
+    reuses a parse the caller already did instead of re-parsing the spec.
+    """
+    if len(comps) == 1 and comps[0][1] == 1:
+        return comps[0][0]
+    parts = []
+    for vid, weight in comps:
+        parts.extend([vid] * weight)
+    return ','.join(parts)
+
+
 def build_synthesizer(voice: str, backend: str = 'cpu'):
     """Return ``synth(text, speed) -> list[np.ndarray]`` (float32 @ 24000 Hz).
 
@@ -273,11 +310,18 @@ def build_synthesizer(voice: str, backend: str = 'cpu'):
     if backend not in backends.BACKENDS:
         raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
     info = backends.BACKENDS[backend]
-    # Resolve the voice spec (single id, preset blend, or 'a:60,b:40' custom blend) into
-    # a language code + an engine-ready voice string. Blends are encoded as repetition in
-    # the comma string, which both Kokoro engines average identically (see voices.py).
-    lang_code = voicelib.voice_lang_code(voice)
-    kokoro_voice = voicelib.kokoro_voice_string(voice)
+    # Resolve the voice spec (single id, preset blend, or 'a:60,b:40' custom blend) ONCE
+    # into its (voice_id, weight) components, then derive both the language code and the
+    # engine-ready voice string from that single parse — avoids re-parsing the same spec
+    # in voice_lang_code() and kokoro_voice_string() (and again in gen_audio_segments).
+    comps = voicelib.parse_voice_spec(voice)
+    # Kokoro runs ONE G2P language code for the whole pipeline: the first component's lang.
+    # For a cross-dialect blend like the 'ab_storyteller' preset (US af_heart + UK bf_emma)
+    # this means the British voicepack is phonemised under the American 'a' G2P. That is a
+    # known single-lang_code limitation of comma-blending in Kokoro, not a parsing bug here;
+    # a proper fix would require per-voicepack G2P which the engine does not expose.
+    lang_code = comps[0][0][0]
+    kokoro_voice = _kokoro_voice_string_from_comps(comps)
     if info.engine == 'mlx':
         if not backends._mlx_importable():
             raise RuntimeError(
@@ -311,11 +355,15 @@ def _build_mlx_synth(voice: str, lang_code: str):
     return synth
 
 
-def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None):
+def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
+                       lang_code=None):
     nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
-    lang_code = voicelib.voice_lang_code(voice)
+    # build_synthesizer already parsed the spec; let it pass the resolved lang_code in to
+    # avoid re-parsing per chapter. Fall back to deriving it when called standalone.
+    if lang_code is None:
+        lang_code = voicelib.voice_lang_code(voice)
 
     if lang_code in 'ab':
         sentences = [s.text for s in doc.sents]
