@@ -17,7 +17,8 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from audiblez.voices import (voices, flags, VOICE_QUALITY, RECOMMENDED_VOICES,
-                             PRESET_BLEND_INFO, DEFAULT_VOICE, parse_voice_spec, grade_rank)
+                             PRESET_BLEND_INFO, DEFAULT_VOICE, parse_voice_spec, grade_rank,
+                             voice_with_grade)
 from audiblez import backends
 
 EVENTS = {
@@ -314,14 +315,12 @@ class MainWindow(wx.Frame):
             voice_choices.append(label)
 
         for v in RECOMMENDED_VOICES:
-            g = VOICE_QUALITY.get(v, '')
-            add_voice_choice(f'⭐ {flags[v[0]]} {v}' + (f'  ({g})' if g else ''), v)
+            add_voice_choice(f'⭐ {flags[v[0]]} {voice_with_grade(v)}', v)
         for name, desc in PRESET_BLEND_INFO.items():
             add_voice_choice(f'🎙️ {name} — {desc}', name)
         for code, vlist in voices.items():
             for v in sorted(vlist, key=lambda x: (grade_rank(VOICE_QUALITY.get(x, '')), x)):
-                g = VOICE_QUALITY.get(v, '')
-                add_voice_choice(f'{flags[code]} {v}' + (f'  ({g})' if g else ''), v)
+                add_voice_choice(f'{flags[code]} {voice_with_grade(v)}', v)
 
         voice_label = wx.StaticText(panel, label="Voice:")
         self.selected_voice = DEFAULT_VOICE

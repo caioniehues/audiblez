@@ -62,6 +62,13 @@ VOICE_QUALITY = {
 _GRADE_ORDER = {'A': 0, 'A-': 1, 'B+': 2, 'B': 3, 'B-': 4, 'C+': 5, 'C': 6, 'C-': 7,
                 'D+': 8, 'D': 9, 'D-': 10, 'F+': 11, 'F': 12}
 
+# Hard cap on the total number of comma-repetition parts a blend expands to. The
+# engine string repeats each voice ``count`` times and Kokoro torch.stacks one
+# voicepack per part, so an unbounded count (e.g. 'af_bella:1000000,af_heart:1')
+# would try to materialise ~1M voicepacks (~500GB) and OOM. We rescale the ratio
+# down to fit this bound while preserving it as closely as integer rounding allows.
+MAX_BLEND_PARTS = 64
+
 # The single best-graded English voice. The old default (af_sky) is only C-.
 DEFAULT_VOICE = 'af_heart'
 
@@ -94,23 +101,38 @@ def grade_rank(grade):
     return _GRADE_ORDER.get(grade, 99)
 
 
-def voice_grade(voice_id):
-    """Overall Kokoro grade for a single voice id, or '' if ungraded."""
-    return VOICE_QUALITY.get(voice_id, '')
-
-
 def _normalize_weights(weights):
-    """Scale positive numeric weights to the smallest integers with the same ratio.
+    """Scale positive numeric weights to small integers with the same ratio.
 
     e.g. [0.6, 0.4] -> [3, 2]; [60, 40] -> [3, 2]; [1, 1] -> [1, 1].
+
+    The weights are first divided by the smallest positive weight before
+    ``limit_denominator`` so near-equal ratios (e.g. 33,33,34) stay small instead
+    of expanding to ~100 parts. The total part count ``sum(counts)`` is then capped
+    at ``MAX_BLEND_PARTS``: anything larger (e.g. 1000000,1) is rescaled
+    proportionally down to fit — preserving the ratio as closely as integer
+    rounding allows and never dropping a positive weight to zero — so the engine's
+    comma-repetition string can never explode into an OOM-sized voicepack stack.
     """
-    fracs = [Fraction(w).limit_denominator(100) for w in weights]
-    if any(f <= 0 for f in fracs):
+    if any(not isfinite(w) or w <= 0 for w in weights):
         raise ValueError('Voice blend weights must be positive')
+    smallest = min(weights)
+    fracs = [Fraction(w / smallest).limit_denominator(100) for w in weights]
+    if any(f <= 0 for f in fracs):
+        # A weight below the precision floor (< smallest/100) rounds to 0 here.
+        raise ValueError('Voice blend weights are too small/uneven to represent; '
+                         'use ratios within ~100x of each other')
     denom = reduce(lambda a, b: a * b // gcd(a, b), [f.denominator for f in fracs], 1)
     counts = [int(f * denom) for f in fracs]
     g = reduce(gcd, counts)
-    return [c // g for c in counts]
+    counts = [c // g for c in counts]
+    total = sum(counts)
+    if total > MAX_BLEND_PARTS:
+        scale = MAX_BLEND_PARTS / total
+        counts = [max(1, round(c * scale)) for c in counts]
+        g = reduce(gcd, counts)
+        counts = [c // g for c in counts]
+    return counts
 
 
 def parse_voice_spec(spec):
@@ -151,8 +173,13 @@ def parse_voice_spec(spec):
             raise ValueError(
                 f'Unknown voice {vid!r}. Use a voice id (e.g. af_heart), a preset blend '
                 f'({", ".join(PRESET_BLENDS)}), or a custom blend like "af_bella:60,af_heart:40".')
-        ids.append(vid)
-        weights.append(weight)
+        # A voice repeated in a blend (e.g. 'af_heart:1,af_heart:1') sums its weights
+        # rather than silently double-counting as two separate parts; first-seen order kept.
+        if vid in ids:
+            weights[ids.index(vid)] += weight
+        else:
+            ids.append(vid)
+            weights.append(weight)
     if not ids:
         raise ValueError(f'No voices found in {spec!r}')
     if len(ids) == 1:
@@ -197,7 +224,11 @@ def voice_label(spec):
     return 'blend-' + '-'.join(f'{vid}x{w}' if w != 1 else vid for vid, w in comps)
 
 
-def _voice_with_grade(v):
+def voice_with_grade(v):
+    """Voice id annotated with its grade, e.g. ``'af_heart (A)'``; bare id if ungraded.
+
+    Public so ui.py / core.py can reuse the exact CLI grade-formatting.
+    """
     g = VOICE_QUALITY.get(v)
     return f'{v} ({g})' if g else v
 
@@ -206,7 +237,7 @@ def _build_available_voices_str():
     """Human-readable voice catalogue for the CLI epilog, annotated with grades."""
     label_flags = flags_win if platform.system() == 'Windows' else flags
     lines = []
-    rec = ', '.join(_voice_with_grade(v) for v in RECOMMENDED_VOICES)
+    rec = ', '.join(voice_with_grade(v) for v in RECOMMENDED_VOICES)
     lines.append(f'  recommended (English):\t{rec}')
     lines.append('  preset blends:\t\t' + ', '.join(f'{n} [{PRESET_BLEND_INFO[n]}]' for n in PRESET_BLENDS))
     lines.append("  custom blend example:\t\taf_bella:60,af_heart:40")
@@ -214,7 +245,7 @@ def _build_available_voices_str():
     lines.append('  all voices (with quality grade):')
     for lang in voices:
         ranked = sorted(voices[lang], key=lambda v: (grade_rank(VOICE_QUALITY.get(v, '')), v))
-        lines.append(f'  {label_flags[lang]}:\t{", ".join(_voice_with_grade(v) for v in ranked)}')
+        lines.append(f'  {label_flags[lang]}:\t{", ".join(voice_with_grade(v) for v in ranked)}')
     return '\n'.join(lines)
 
 
