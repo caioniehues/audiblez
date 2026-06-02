@@ -33,8 +33,11 @@ border = 5
 class MainWindow(wx.Frame):
     def __init__(self, parent, title):
         screen_width, screen_h = wx.GetDisplaySize()
-        self.window_width = int(screen_width * 0.6)
-        super().__init__(parent, title=title, size=(self.window_width, self.window_width * 3 // 4))
+        # Cap the default size so it doesn't open enormous on large/Retina displays.
+        self.window_width = min(1400, int(screen_width * 0.7))
+        window_height = min(900, int(screen_h * 0.8))
+        super().__init__(parent, title=title, size=(self.window_width, window_height))
+        self.SetMinSize((900, 600))
         self.chapters_panel = None
         self.preview_threads = []
         self.selected_chapter = None
@@ -74,6 +77,7 @@ class MainWindow(wx.Frame):
         self.progress_bar.SetValue(0)
         self.progress_bar.Layout()
         self.eta_label.Show()
+        if hasattr(self, 'done_label'): self.done_label.Hide()
         self.params_panel.Layout()
         self.synth_panel.Layout()
 
@@ -94,13 +98,19 @@ class MainWindow(wx.Frame):
 
     def on_core_finished(self, event):
         self.synthesis_in_progress = False
+        out = self.output_folder_text_ctrl.GetValue()
+        self.progress_bar.SetValue(100)
+        self.progress_bar_label.SetLabel("Synthesis Progress: 100%")
+        self.eta_label.Hide()
+        self.done_label.SetLabel(f"✅ Done — audiobook saved to:\n{out}")
+        self.done_label.Show()
         # Re-enable the controls disabled in on_start so another book can be generated.
         self.start_button.Enable()
         self.start_button.Show()
         self.params_panel.Enable()
         self.table.EnableCheckBoxes(True)
         self.synth_panel.Layout()
-        self.open_folder_with_explorer(self.output_folder_text_ctrl.GetValue())
+        self.open_folder_with_explorer(out)
 
     def create_layout(self):
         # Panels layout looks like this:
@@ -146,6 +156,14 @@ class MainWindow(wx.Frame):
         self.splitter_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self.splitter.SetSizer(self.splitter_sizer)
 
+        # First-run hint shown in the empty area until an EPUB is opened.
+        self.start_hint = wx.StaticText(
+            self.splitter,
+            label='👈  Click “📁 Open EPUB”  (or press ⌘O)  to load a book and begin.',
+            style=wx.ALIGN_CENTRE_HORIZONTAL)
+        self.start_hint.SetFont(wx.Font(16, wx.DEFAULT, wx.NORMAL, wx.NORMAL))
+        self.splitter_sizer.Add(self.start_hint, 1, wx.ALL | wx.EXPAND, 60)
+
         self.main_sizer.Add(top_panel, 0, wx.ALL | wx.EXPAND, 5)
         self.main_sizer.Add(self.splitter, 1, wx.EXPAND)
 
@@ -153,8 +171,8 @@ class MainWindow(wx.Frame):
         splitter_left = wx.Panel(splitter, -1)
         splitter_right = wx.Panel(self.splitter)
         self.splitter_left, self.splitter_right = splitter_left, splitter_right
-        self.splitter_sizer.Add(splitter_left, 1, wx.ALL | wx.EXPAND, 5)
-        self.splitter_sizer.Add(splitter_right, 2, wx.ALL | wx.EXPAND, 5)
+        self.splitter_sizer.Add(splitter_left, 2, wx.ALL | wx.EXPAND, 5)
+        self.splitter_sizer.Add(splitter_right, 3, wx.ALL | wx.EXPAND, 5)
 
         self.left_sizer = wx.BoxSizer(wx.VERTICAL)
         splitter_left.SetSizer(self.left_sizer)
@@ -163,7 +181,7 @@ class MainWindow(wx.Frame):
         self.center_panel = wx.Panel(splitter_right)
         self.center_sizer = wx.BoxSizer(wx.VERTICAL)
         self.center_panel.SetSizer(self.center_sizer)
-        self.text_area = wx.TextCtrl(self.center_panel, style=wx.TE_MULTILINE, size=(int(self.window_width * 0.4), -1))
+        self.text_area = wx.TextCtrl(self.center_panel, style=wx.TE_MULTILINE)
         font = wx.Font(14, wx.MODERN, wx.NORMAL, wx.NORMAL)
         self.text_area.SetFont(font)
         # On text change, update the extracted_text attribute of the selected_chapter:
@@ -295,13 +313,14 @@ class MainWindow(wx.Frame):
         sizer.Add(voice_label, pos=(1, 0), flag=wx.ALL, border=border)
         sizer.Add(voice_dropdown, pos=(1, 1), flag=wx.ALL, border=border)
 
-        # Add dropdown for speed
+        # Speed: a spin control bounded to 0.5–2.0 (cannot accept invalid input)
         speed_label = wx.StaticText(panel, label="Speed:")
-        speed_text_input = wx.TextCtrl(panel, value="1.0")
-        self.selected_speed = '1.0'
-        speed_text_input.Bind(wx.EVT_TEXT, self.on_select_speed)
+        self.selected_speed = 1.0
+        speed_spin = wx.SpinCtrlDouble(panel, value="1.0", min=0.5, max=2.0, inc=0.1)
+        speed_spin.SetDigits(1)
+        speed_spin.Bind(wx.EVT_SPINCTRLDOUBLE, self.on_select_speed)
         sizer.Add(speed_label, pos=(2, 0), flag=wx.ALL, border=border)
-        sizer.Add(speed_text_input, pos=(2, 1), flag=wx.ALL, border=border)
+        sizer.Add(speed_spin, pos=(2, 1), flag=wx.ALL, border=border)
 
         # Add file dialog selector to select output folder
         output_folder_label = wx.StaticText(panel, label="Output Folder:")
@@ -345,6 +364,12 @@ class MainWindow(wx.Frame):
         self.eta_label.Hide()
         sizer.Add(self.eta_label, 0, wx.ALL, 5)
 
+        # Completion banner (shown when synthesis finishes)
+        self.done_label = wx.StaticText(panel, label="")
+        self.done_label.SetForegroundColour(wx.Colour(40, 160, 70))
+        self.done_label.Hide()
+        sizer.Add(self.done_label, 0, wx.ALL, 5)
+
     def open_output_folder_dialog(self, event):
         with wx.DirDialog(self, "Choose a directory:", style=wx.DD_DEFAULT_STYLE) as dialog:
             if dialog.ShowModal() == wx.ID_CANCEL:
@@ -357,17 +382,14 @@ class MainWindow(wx.Frame):
         self.selected_voice = event.GetString()
 
     def on_select_speed(self, event):
-        try:
-            speed = float(event.GetString())
-        except ValueError:
-            return  # ignore transient/invalid input; keep the last valid speed
-        print('Selected speed', speed)
-        self.selected_speed = speed
+        self.selected_speed = event.GetValue()  # SpinCtrlDouble -> bounded float
+        print('Selected speed', self.selected_speed)
 
     def open_epub(self, file_path):
-        # Cleanup previous layout
-        if hasattr(self, 'selected_book'):
-            self.splitter.DestroyChildren()
+        # Cleanup previous layout (and the first-run hint) before (re)building.
+        self.splitter.DestroyChildren()
+        self.splitter_sizer.Clear()
+        self.chapters_panel = None
 
         self.selected_file_path = file_path
         print(f"Opening file: {file_path}")  # Do something with the filepath (e.g., parse the EPUB)
@@ -388,6 +410,8 @@ class MainWindow(wx.Frame):
             chapter.is_selected = id(chapter) in good_ids
 
         self.create_layout_for_ebook(self.splitter)
+        # Pre-fill the editor with the first selected chapter's text.
+        self.text_area.SetValue(self.selected_chapter.extracted_text)
 
         # Update Cover
         cover = find_cover(book)
