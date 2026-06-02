@@ -17,6 +17,7 @@ dependencies = [
     "kokoro==0.9.4",
     "misaki[zh]>=0.9.2",
     "torch>=2.0.0",
+    "numpy>=1.24",
     "tabulate>=0.9.0,<0.10.0",
 ]
 exclude = [
@@ -52,3 +53,11 @@ audiblez-ui = "audiblez.ui:main"
 
 [tool.poetry.group.dev.dependencies]
 deptry = "^0.23.0"
+
+[tool.deptry.per_rule_ignores]
+# lxml is used via BeautifulSoup(features='lxml') (not imported by name);
+# misaki[zh] provides kokoro's Chinese g2p backend used at runtime.
+DEP002 = ["lxml", "misaki"]
+# phonemizer (provided by phonemizer-fork) is supplied by the kokoro/misaki TTS
+# stack and imported under a guarded try/except in set_espeak_library.
+DEP003 = ["phonemizer"]
