@@ -5,7 +5,7 @@
 ![PyPI - Python Version](https://img.shields.io/pypi/pyversions/audiblez)
 ![PyPI - Version](https://img.shields.io/pypi/v/audiblez)
 
-### v4 Now with Graphical interface, CUDA support, and many languages!
+### v4 Now with Graphical interface, GPU acceleration (CUDA / AMD ROCm / Apple Silicon), and many languages!
 
 ![Audiblez GUI on MacOSX](./imgs/mac.png)
 
@@ -34,6 +34,7 @@ pip install audiblez
 ```bash
 brew install ffmpeg espeak-ng                       # on Mac 🍏
 pip install audiblez
+pip install "audiblez[mlx]"                          # optional: native Apple Silicon (MLX) engine, fastest on Mac
 ```
 
 Then you can convert an .epub directly with:
@@ -107,13 +108,32 @@ The first letter is the language code and the second is the gender of the speake
 
 For more detaila about voice quality, check this document: [Kokoro-82M voices](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)
 
-## How to run on GPU
+## Choosing a backend (GPU acceleration)
 
-By default, audiblez runs on CPU. If you pass the option `--cuda` it will try to use the Cuda device via Torch.
+By default audiblez runs on **CPU**. Use `-b/--backend` to pick a faster engine:
 
-Check out this example: [Audiblez running on a Google Colab Notebook with Cuda ](https://colab.research.google.com/drive/164PQLowogprWQpRjKk33e-8IORAvqXKI?usp=sharing]).
+| Backend | Flag      | Hardware        | Notes                                                                       |
+|---------|-----------|-----------------|-----------------------------------------------------------------------------|
+| CPU     | `-b cpu`  | any             | default                                                                     |
+| CUDA    | `-b cuda` | NVIDIA GPU      | requires a CUDA build of PyTorch                                            |
+| ROCm    | `-b rocm` | AMD GPU         | Linux only; requires a ROCm build of PyTorch                                |
+| MPS     | `-b mps`  | Apple Silicon   | PyTorch Metal backend                                                       |
+| MLX     | `-b mlx`  | Apple Silicon   | native Apple engine, fastest on Mac — needs `pip install "audiblez[mlx]"`   |
 
-We don't currently support Apple Silicon, as there is not yet a Kokoro implementation in MLX. As soon as it will be available, we will support it.
+```
+audiblez book.epub -v af_sky -b mlx     # Apple Silicon (fastest)
+audiblez book.epub -v af_sky -b cuda    # NVIDIA
+audiblez book.epub -v af_sky -b rocm    # AMD (Linux)
+```
+
+The GUI exposes the same choices as radio buttons — only the backends actually available on your
+machine are shown. If you request a backend that isn't available, audiblez warns and falls back to CPU.
+`--cuda` is still accepted as a deprecated alias for `-b cuda` (and maps to `-b rocm` on a ROCm build).
+
+**Apple Silicon** is fully supported via both **MLX** (native, fastest — `pip install "audiblez[mlx]"`)
+and **MPS** (PyTorch Metal). On an M-series Mac, MLX narrates several times faster than CPU.
+
+**NVIDIA Cuda example:** [Audiblez on a Google Colab Notebook with Cuda](https://colab.research.google.com/drive/164PQLowogprWQpRjKk33e-8IORAvqXKI?usp=sharing).
 
 ## Manually pick chapters to convert
 
@@ -126,24 +146,23 @@ To do so, you can use `--pick` to interactively choose the chapters to convert (
 For all the options available, you can check the help page `audiblez --help`:
 
 ```
-usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-c] [-o FOLDER] epub_file_path
+usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-b {cpu,cuda,rocm,mps,mlx}] [-o FOLDER] epub_file_path
 
 positional arguments:
   epub_file_path        Path to the epub file
 
 options:
   -h, --help            show this help message and exit
-  -v VOICE, --voice VOICE
-                        Choose narrating voice: a, b, e, f, h, i, j, p, z
+  -v, --voice VOICE     Choose narrating voice: a, b, e, f, h, i, j, p, z
   -p, --pick            Interactively select which chapters to read in the audiobook
-  -s SPEED, --speed SPEED
-                        Set speed from 0.5 to 2.0
-  -c, --cuda            Use GPU via Cuda in Torch if available
-  -o FOLDER, --output FOLDER
-                        Output folder for the audiobook and temporary files
+  -s, --speed SPEED     Set speed from 0.5 to 2.0
+  -b, --backend {cpu,cuda,rocm,mps,mlx}
+                        Narration backend: cpu, cuda (NVIDIA), rocm (AMD), mps
+                        (Apple Silicon), mlx (Apple Silicon native). Default: cpu.
+  -o, --output FOLDER   Output folder for the audiobook and temporary files
 
 example:
-  audiblez book.epub -l en-us -v af_sky
+  audiblez book.epub -v af_sky -b mlx
 
 to use the GUI, run:
   audiblez-ui

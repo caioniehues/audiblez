@@ -9,7 +9,7 @@ from audiblez import backends
 def cli_main():
     voices_str = ', '.join(voices)
     epilog = ('example:\n' +
-              '  audiblez book.epub -l en-us -v af_sky\n\n' +
+              '  audiblez book.epub -v af_sky -b mlx\n\n' +
               'to run GUI just run:\n'
               '  audiblez-ui\n\n' +
               'available voices:\n' +
