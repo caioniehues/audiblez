@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # A simple wxWidgets UI for audiblez
 
-import torch.cuda
 import numpy as np
 import soundfile
 import threading
@@ -18,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from audiblez.voices import voices, flags
+from audiblez import backends
 
 EVENTS = {
     'CORE_STARTED': NewEvent(),
@@ -259,23 +259,27 @@ class MainWindow(wx.Frame):
         sizer = wx.GridBagSizer(10, 10)
         panel.SetSizer(sizer)
 
+        # Build one radio per backend actually available on this machine. The torch device
+        # (or MLX engine) is selected later, once, in core.build_synthesizer on the worker
+        # thread — not on every click — so selection here just records self.selected_backend.
         engine_label = wx.StaticText(panel, label="Engine:")
         engine_radio_panel = wx.Panel(panel)
-        cpu_radio = wx.RadioButton(engine_radio_panel, label="CPU", style=wx.RB_GROUP)
-        cuda_radio = wx.RadioButton(engine_radio_panel, label="CUDA")
-        if torch.cuda.is_available():
-            cuda_radio.SetValue(True)
-        else:
-            cpu_radio.SetValue(True)
-            # cuda_radio.Disable()
-        sizer.Add(engine_label, pos=(0, 0), flag=wx.ALL, border=border)
-        sizer.Add(engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
         engine_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
         engine_radio_panel.SetSizer(engine_radio_panel_sizer)
-        engine_radio_panel_sizer.Add(cpu_radio, 0, wx.ALL, 5)
-        engine_radio_panel_sizer.Add(cuda_radio, 0, wx.ALL, 5)
-        cpu_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cpu'))
-        cuda_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cuda'))
+        self.backend_radios = {}
+        avail = backends.available_backends()
+        default = backends.default_backend()
+        self.selected_backend = default
+        for idx, bid in enumerate(avail):
+            style = wx.RB_GROUP if idx == 0 else 0
+            rb = wx.RadioButton(engine_radio_panel, label=backends.BACKENDS[bid].label, style=style)
+            rb.Bind(wx.EVT_RADIOBUTTON, lambda event, b=bid: setattr(self, 'selected_backend', b))
+            if bid == default:
+                rb.SetValue(True)
+            self.backend_radios[bid] = rb
+            engine_radio_panel_sizer.Add(rb, 0, wx.ALL, 5)
+        sizer.Add(engine_label, pos=(0, 0), flag=wx.ALL, border=border)
+        sizer.Add(engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
 
         # Create a list of voices with flags
         flag_and_voice_list = []
@@ -470,7 +474,6 @@ class MainWindow(wx.Frame):
             return
         voice = self.get_selected_voice()
         speed = self.get_selected_speed()
-        lang_code = voice[0]
         button.SetLabel("⏳")
         button.Disable()
 
@@ -482,10 +485,9 @@ class MainWindow(wx.Frame):
             tmp_path = None
             try:
                 import audiblez.core as core
-                from kokoro import KPipeline
-                pipeline = KPipeline(lang_code=lang_code)
+                synth = core.build_synthesizer(voice, getattr(self, 'selected_backend', 'cpu'))
                 core.load_spacy()
-                audio_segments = core.gen_audio_segments(pipeline, text, voice=voice, speed=speed)
+                audio_segments = core.gen_audio_segments(synth, text, voice=voice, speed=speed)
                 if not audio_segments:
                     return
                 final_audio = np.concatenate(audio_segments)
@@ -530,7 +532,7 @@ class MainWindow(wx.Frame):
         self.core_thread = CoreThread(params=dict(
             file_path=file_path, voice=voice, pick_manually=False, speed=speed,
             output_folder=self.output_folder_text_ctrl.GetValue(),
-            selected_chapters=selected_chapters))
+            selected_chapters=selected_chapters, backend=self.selected_backend))
         self.core_thread.start()
 
     def on_open(self, event):

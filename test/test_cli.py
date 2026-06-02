@@ -33,6 +33,18 @@ class CliHelpTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('usage:', out)
 
+    def test_help_lists_backends(self):
+        out = run_cli('--help').stdout + run_cli('--help').stderr
+        self.assertIn('--backend', out)
+        for b in ('cpu', 'cuda', 'rocm', 'mps', 'mlx'):
+            self.assertIn(b, out)
+
+    def test_invalid_backend_rejected(self):
+        proc = run_cli('--backend', 'bogus', 'dummy.epub')
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('invalid choice', out)
+
 
 if __name__ == '__main__':
     unittest.main()

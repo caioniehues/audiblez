@@ -7,7 +7,6 @@ import os
 import traceback
 from glob import glob
 
-import torch.cuda
 import spacy
 import ebooklib
 import soundfile
@@ -25,6 +24,8 @@ from bs4 import BeautifulSoup
 from kokoro import KPipeline
 from ebooklib import epub
 from pick import pick
+
+from audiblez import backends
 
 sample_rate = 24000
 _nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
@@ -108,7 +109,7 @@ def extract_book_metadata(book):
 
 def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_folder: str = '.',
          max_chapters: int | None = None, max_sentences: int | None = None,
-         selected_chapters: list | None = None, post_event=None) -> None:
+         selected_chapters: list | None = None, backend: str = 'cpu', post_event=None) -> None:
     if post_event: post_event('CORE_STARTED')
     load_spacy()
     if output_folder != '.':
@@ -141,14 +142,14 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     stats = SimpleNamespace(
         total_chars=sum(map(len, texts)),
         processed_chars=0,
-        chars_per_sec=GPU_CHARS_PER_SEC if torch.cuda.is_available() else CPU_CHARS_PER_SEC)
+        chars_per_sec=GPU_CHARS_PER_SEC if backends.is_gpu(backend) else CPU_CHARS_PER_SEC)
     print('Started at:', time.strftime('%H:%M:%S'))
     print(f'Total characters: {stats.total_chars:,}')
     print('Total words:', len(' '.join(texts).split()))
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
     set_espeak_library()
-    pipeline = KPipeline(lang_code=voice[0], repo_id='hexgrad/Kokoro-82M')  # a=american, b=british, ...
+    synth = build_synthesizer(voice, backend)
 
     chapter_wav_files = []
     intro_added = False
@@ -176,7 +177,7 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
-            pipeline, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
+            synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -242,7 +243,51 @@ def split_long_sentence(text, max_length=MAX_SENTENCE_LENGTH):
     return parts
 
 
-def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None):
+def build_synthesizer(voice: str, backend: str = 'cpu'):
+    """Return ``synth(text, speed) -> list[np.ndarray]`` (float32 @ 24000 Hz).
+
+    Torch backends (cpu/cuda/rocm/mps) set the process-global default device and build
+    a Kokoro KPipeline; the mlx backend loads the Apple-Silicon-native Kokoro model.
+    Both engines emit identical-format audio, so everything downstream is engine-agnostic.
+    """
+    if backend not in backends.BACKENDS:
+        raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
+    info = backends.BACKENDS[backend]
+    lang_code = voice[0]
+    if info.engine == 'mlx':
+        if not backends._mlx_importable():
+            raise RuntimeError(
+                "Backend 'mlx' requires mlx-audio on Apple Silicon. "
+                'Install it with: pip install "audiblez[mlx]"')
+        return _build_mlx_synth(voice, lang_code)
+    # torch path (cpu/cuda/rocm/mps): KPipeline's device= does a proper model .to(device),
+    # which (unlike a global torch.set_default_device) actually works on MPS and avoids
+    # mutating process-wide torch state.
+    pipeline = KPipeline(lang_code=lang_code, repo_id='hexgrad/Kokoro-82M', device=info.torch_device)
+
+    def synth(text, speed):
+        return [to_numpy(audio)
+                for _gs, _ps, audio in pipeline(text, voice=voice, speed=speed, split_pattern=r'\n\n\n')]
+    return synth
+
+
+def _build_mlx_synth(voice: str, lang_code: str):
+    """Engine closure for the Apple-Silicon-native MLX backend (optional dependency).
+
+    mlx-audio is imported here, never at module scope, so importing audiblez.core does
+    not require it on non-Apple platforms.
+    """
+    from mlx_audio.tts.utils import load_model  # optional dep; only when mlx is selected
+    model = load_model('mlx-community/Kokoro-82M-bf16')
+
+    def synth(text, speed):
+        return [np.asarray(seg.audio).reshape(-1)
+                for seg in model.generate(text, voice=voice, speed=speed,
+                                          lang_code=lang_code, split_pattern=r'\n\n\n')]
+    return synth
+
+
+def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None):
     nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
@@ -263,8 +308,7 @@ def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=N
 
     for i, sent_text in enumerate(sentences):
         if max_sentences and i >= max_sentences: break
-        for gs, ps, audio in pipeline(sent_text, voice=voice, speed=speed, split_pattern=r'\n\n\n'):
-            audio_segments.append(to_numpy(audio))
+        audio_segments.extend(synth(sent_text, speed))
         if stats:
             stats.processed_chars += len(sent_text)
             stats.progress = stats.processed_chars * 100 // stats.total_chars
@@ -275,11 +319,10 @@ def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=N
     return audio_segments
 
 
-def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False):
-    lang_code = voice[:1]
-    pipeline = KPipeline(lang_code=lang_code, repo_id='hexgrad/Kokoro-82M')
+def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False, backend='cpu'):
     load_spacy()
-    audio_segments = gen_audio_segments(pipeline, text, voice=voice, speed=speed)
+    synth = build_synthesizer(voice, backend)
+    audio_segments = gen_audio_segments(synth, text, voice=voice, speed=speed)
     if not audio_segments:
         print('Warning: no audio generated for the given text.')
         return
