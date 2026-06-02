@@ -59,6 +59,12 @@ audiblez-ui = "audiblez.ui:main"
 [tool.poetry.group.dev.dependencies]
 deptry = "^0.23.0"
 
+[tool.deptry]
+# The standalone data-prep tool (tools/voice_dataset/) ships its OWN requirements.txt
+# (whisperx/demucs/speechbrain/...) and is not part of the audiblez package, so it is
+# excluded from the package-level dependency audit.
+extend_exclude = ["tools"]
+
 [tool.deptry.per_rule_ignores]
 # lxml is used via BeautifulSoup(features='lxml') (not imported by name);
 # misaki[zh] provides kokoro's Chinese g2p backend used at runtime.
