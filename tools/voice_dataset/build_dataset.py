@@ -19,6 +19,7 @@ This is a standalone offline tool — it is NOT imported by audiblez and has its
 (see requirements.txt). Heavy ML libs are imported lazily so `--help` works without them.
 """
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -65,7 +66,7 @@ def ffmpeg_to_mono_wav(src: Path, dst: Path, sr: int) -> None:
     subprocess.run(
         ['ffmpeg', '-y', '-i', str(src), '-ac', '1', '-ar', str(sr),
          '-af', 'aresample=resampler=soxr:precision=28', '-c:a', 'pcm_s16le', str(dst)],
-        check=True, capture_output=True)
+        check=True, capture_output=True, timeout=300)  # hung ffmpeg on a bad file must not block forever
 
 
 def to_working_wav(src: Path, dst: Path, sr: int, separator) -> None:
@@ -135,8 +136,11 @@ def narrator_words(result):
             text = (w.get('word') or '').strip()
             if not text:
                 continue
+            spk = w.get('speaker', seg_spk)
+            if spk is None:  # un-diarized word: don't let it pollute the single-speaker set
+                continue
             out.append({'word': text, 'start': float(w['start']), 'end': float(w['end']),
-                        'speaker': w.get('speaker', seg_spk)})
+                        'speaker': spk})
     out.sort(key=lambda x: x['start'])
     return out
 
@@ -174,7 +178,11 @@ def select_narrator(words, full_audio, full_sr, matcher, ref_emb, threshold):
         return None, 'no aligned words'
     spans = {}
     for w in words:
+        if w['speaker'] is None:  # never treat un-diarized audio as a valid narrator
+            continue
         spans.setdefault(w['speaker'], []).append((w['start'], w['end']))
+    if not spans:
+        return None, 'no diarized words'
     if matcher is None or ref_emb is None:
         # Fallback: the dominant speaker (most total speech) is the host.
         best = max(spans, key=lambda s: sum(e - st for st, e in spans[s]))
@@ -211,15 +219,31 @@ def segment_words(words, min_dur, max_dur, min_chars, max_gap):
     """
     segs, cur = [], []
 
+    def _emit_one(chunk):
+        s, e = chunk[0]['start'], chunk[-1]['end']
+        text = ' '.join(w['word'] for w in chunk).strip()
+        if (e - s) >= min_dur and len(text) >= min_chars:
+            segs.append((s, e, text))
+
     def emit(chunk):
         # Only keep clips that actually END a sentence — a non-terminal tail is almost
         # always a mid-sentence ASR cut, which the research says to drop, not force-punctuate.
         if not chunk or not ends_sentence(chunk[-1]['word']):
             return
-        s, e = chunk[0]['start'], chunk[-1]['end']
-        text = ' '.join(w['word'] for w in chunk).strip()
-        if (e - s) >= min_dur and len(text) >= min_chars:
-            segs.append((s, e, text))
+        # Cap clip length at max_dur: split on interior sentence ends, dropping any
+        # final over-long run-on with no usable break (main() would silently drop it anyway).
+        start = 0
+        while start < len(chunk):
+            if chunk[-1]['end'] - chunk[start]['start'] <= max_dur:
+                _emit_one(chunk[start:])
+                break
+            cut = next((i for i in range(len(chunk) - 1, start - 1, -1)
+                        if ends_sentence(chunk[i]['word'])
+                        and chunk[i]['end'] - chunk[start]['start'] <= max_dur), None)
+            if cut is None:  # no sentence end fits within max_dur from here: drop the rest
+                break
+            _emit_one(chunk[start:cut + 1])
+            start = cut + 1
 
     for w in words:
         if cur and (w['start'] - cur[-1]['end'] > max_gap):
@@ -285,8 +309,9 @@ def write_manifests(out: Path, records: list[dict], speaker: str, val_fraction: 
     # 2) StyleTTS2: filename.wav|text|speaker_id  (integer speaker, .wav included)
     lines = [f"{r['id']}.wav|{r['norm']}|0" for r in records]
     split = max(1, int(len(lines) * val_fraction)) if len(lines) > 10 else 0
+    train = lines[split:]
     (out / 'val_list.txt').write_text('\n'.join(lines[:split]) + ('\n' if split else ''), encoding='utf-8')
-    (out / 'train_list.txt').write_text('\n'.join(lines[split:]) + '\n', encoding='utf-8')
+    (out / 'train_list.txt').write_text('\n'.join(train) + ('\n' if train else ''), encoding='utf-8')
     # 3) Coqui XTTS: header + audio_file|text|speaker_name  (path with .wav)
     with open(out / 'metadata_xtts.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f, delimiter='|', quoting=csv.QUOTE_NONE, escapechar='\\')
@@ -306,6 +331,28 @@ def discover_inputs(input_path: Path) -> list[Path]:
 
 def total_seconds(records: list[dict]) -> float:
     return sum(r.get('dur', 0.0) for r in records)
+
+
+def load_records(records_path: Path) -> list[dict]:
+    """Read records.jsonl, tolerating a truncated final line from a kill mid-write."""
+    if not records_path.exists():
+        return []
+    records = []
+    for line in records_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            print(f'    ! skipping malformed records.jsonl line (truncated write?): {line[:80]!r}')
+    return records
+
+
+def write_state_atomic(state_path: Path, state: dict) -> None:
+    """Write state.json via temp-file + os.replace so a crash can't leave it half-written."""
+    tmp = state_path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(state, indent=0))
+    os.replace(tmp, state_path)
 
 
 def main():
@@ -360,11 +407,18 @@ def main():
     out = args.out
     wavs = out / 'wavs'
     wavs.mkdir(parents=True, exist_ok=True)
+    # Advisory lock: a second run over the same out dir would collide on clip ids.
+    lock_f = open(out / '.lock', 'w')
+    try:
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(f'error: another build_dataset run is already using {out}/ (lock held). '
+                 'Wait for it to finish or pick a different --out.')
     state_path = out / 'state.json'
     records_path = out / 'records.jsonl'
     state = json.loads(state_path.read_text()) if state_path.exists() else {'done': []}
     done = set(state['done'])
-    records = [json.loads(l) for l in records_path.read_text().splitlines()] if records_path.exists() else []
+    records = load_records(records_path)
     next_idx = max((int(r['id'].rsplit('-', 1)[1]) for r in records), default=-1) + 1
 
     device = pick_device(args.device)
@@ -401,53 +455,67 @@ def main():
             print(f'[{n}/{len(inputs)}] {src.name}')
             with tempfile.TemporaryDirectory() as td:
                 work = Path(td) / 'work.wav'
+                # Buffer this file's records and commit them + mark done together, so a
+                # mid-file crash leaves NO partial records (resume reprocesses cleanly,
+                # reusing the same next_idx and overwriting any orphan wavs).
+                file_records = []
                 try:
                     to_working_wav(src, work, args.sr, separator)
                     result, audio16k = transcribe_file(work, m, args.batch_size)
                     result = diarize_and_assign(audio16k, result, m, args.min_speakers, args.max_speakers)
-                except subprocess.CalledProcessError as e:
-                    print(f'    ! ffmpeg failed, skipping: {e.stderr.decode()[-200:] if e.stderr else e}')
+
+                    words = narrator_words(result)
+                    full, full_sr = sf.read(str(work), dtype='float32', always_2d=False)
+                    narrator, info = select_narrator(words, full, full_sr, matcher, ref_emb, args.sim_threshold)
+                    if narrator is None:
+                        print(f'    - {info}; no clips from this file')
+                        done.add(key)
+                        write_state_atomic(state_path, {'done': sorted(done)})
+                        state['done'] = sorted(done)
+                        continue
+                    print(f'    narrator: {info}')
+
+                    nwords = [w for w in words if w['speaker'] == narrator]
+                    clips = segment_words(nwords, args.min_dur, args.max_dur, args.min_chars, args.max_gap)
+                    for (s, e, raw) in clips:
+                        seg = full[int(s * full_sr):int(e * full_sr)]
+                        if (len(seg) / full_sr) < args.min_dur or (len(seg) / full_sr) > args.max_dur:
+                            continue
+                        norm = normalize_text(raw)
+                        if len(norm) < args.min_chars or not ends_sentence(norm):
+                            continue
+                        cid = f"{args.speaker}-{next_idx:06d}"
+                        if not write_clip(seg.copy(), full_sr, wavs / f'{cid}.wav', args.lufs, args.peak_db):
+                            continue
+                        file_records.append({'id': cid, 'wav': f'wavs/{cid}.wav', 'raw': raw.strip(),
+                                             'norm': norm, 'speaker': args.speaker,
+                                             'dur': round(len(seg) / full_sr, 3), 'source': src.name})
+                        next_idx += 1
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    # ffmpeg failed or hung — mark done so a permanently-bad file isn't retried every resume.
+                    stderr = getattr(e, 'stderr', None)
+                    detail = stderr.decode()[-200:] if isinstance(stderr, bytes) else e
+                    print(f'    ! ffmpeg failed, skipping: {detail}')
+                    done.add(key)
+                    write_state_atomic(state_path, {'done': sorted(done)})
+                    state['done'] = sorted(done)
                     continue
                 except Exception as e:  # noqa: BLE001 - one bad file shouldn't kill an hours-long run
-                    print(f'    ! transcription failed, skipping: {type(e).__name__}: {e}')
-                    continue
-
-                words = narrator_words(result)
-                full, full_sr = sf.read(str(work), dtype='float32', always_2d=False)
-                narrator, info = select_narrator(words, full, full_sr, matcher, ref_emb, args.sim_threshold)
-                if narrator is None:
-                    print(f'    - {info}; no clips from this file')
+                    print(f'    ! processing failed, skipping: {type(e).__name__}: {e}')
                     done.add(key)
+                    write_state_atomic(state_path, {'done': sorted(done)})
                     state['done'] = sorted(done)
-                    state_path.write_text(json.dumps(state, indent=0))
                     continue
-                print(f'    narrator: {info}')
 
-                nwords = [w for w in words if w['speaker'] == narrator]
-                clips = segment_words(nwords, args.min_dur, args.max_dur, args.min_chars, args.max_gap)
-                kept = 0
-                for (s, e, raw) in clips:
-                    seg = full[int(s * full_sr):int(e * full_sr)]
-                    if (len(seg) / full_sr) < args.min_dur or (len(seg) / full_sr) > args.max_dur:
-                        continue
-                    norm = normalize_text(raw)
-                    if len(norm) < args.min_chars or not ends_sentence(norm):
-                        continue
-                    cid = f"{args.speaker}-{next_idx:06d}"
-                    if not write_clip(seg.copy(), full_sr, wavs / f'{cid}.wav', args.lufs, args.peak_db):
-                        continue
-                    rec = {'id': cid, 'wav': f'wavs/{cid}.wav', 'raw': raw.strip(), 'norm': norm,
-                           'speaker': args.speaker, 'dur': round(len(seg) / full_sr, 3), 'source': src.name}
-                    records.append(rec)
-                    rec_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-                    rec_f.flush()
-                    next_idx += 1
-                    kept += 1
-                print(f'    + {kept} clips')
-
+            # File fully processed: flush its records and mark it done in one atomic step.
+            for rec in file_records:
+                records.append(rec)
+                rec_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            rec_f.flush()
+            print(f'    + {len(file_records)} clips')
             done.add(key)
+            write_state_atomic(state_path, {'done': sorted(done)})
             state['done'] = sorted(done)
-            state_path.write_text(json.dumps(state, indent=0))
     finally:
         rec_f.close()
 
