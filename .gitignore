@@ -13,3 +13,6 @@ chapters.txt
 dist
 .venv
 *.m4b
+
+# Compound Engineering local config (machine-local, not committed)
+.compound-engineering/*.local.yaml

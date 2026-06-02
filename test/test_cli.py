@@ -45,6 +45,19 @@ class CliHelpTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('invalid choice', out)
 
+    def test_help_mentions_recommended_default_and_presets(self):
+        out = run_cli('--help').stdout + run_cli('--help').stderr
+        self.assertIn('af_heart', out)        # the new default / recommended voice
+        self.assertIn('(A)', out)             # quality grades are surfaced
+        self.assertIn('af_warm', out)         # a curated preset blend
+
+    def test_invalid_voice_rejected_cleanly(self):
+        # A bad voice fails at the CLI (clean message), not deep in synthesis.
+        proc = run_cli('--voice', 'af_nope', 'dummy.epub')
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('Unknown voice', out)
+
 
 if __name__ == '__main__':
     unittest.main()

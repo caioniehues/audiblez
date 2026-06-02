@@ -26,6 +26,7 @@ from ebooklib import epub
 from pick import pick
 
 from audiblez import backends
+from audiblez import voices as voicelib
 
 sample_rate = 24000
 _nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
@@ -83,7 +84,12 @@ def set_espeak_library():
         elif platform.system() == 'Linux':
             library = glob('/usr/lib/*/libespeak-ng*')[0]
         elif platform.system() == 'Windows':
-            library = 'C:\\Program Files*\\eSpeak NG\\libespeak-ng.dll'
+            # Unlike Linux/Darwin below, this branch must glob too: the '*' (to match both
+            # 'Program Files' and 'Program Files (x86)') is a wildcard, not a literal path.
+            pattern = 'C:\\Program Files*\\eSpeak NG\\libespeak-ng.dll'
+            if not (library := next(iter(glob(pattern)), None)):
+                raise RuntimeError('No eSpeak NG library found. Install it from '
+                                   'https://github.com/espeak-ng/espeak-ng/releases')
         else:
             print('Unsupported OS, please set the espeak library path manually')
             return
@@ -156,12 +162,19 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
-        xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-        chapter_wav_path = Path(output_folder) / f'{Path(filename).stem}_chapter_{i}_{voice}_{xhtml_file_name}.wav'
+        # Whitelist-sanitize: get_name() comes from the (attacker-controllable) epub manifest href, and a
+        # raw newline or quote in it would break out of the ffmpeg concat list. Keep only filename-safe chars.
+        xhtml_file_name = re.sub(r'[^A-Za-z0-9._-]', '_', chapter.get_name())
+        voice_tag = voicelib.voice_label(voice)  # safe for blend specs (e.g. 'af_bella:60,af_heart:40')
+        chapter_wav_path = Path(output_folder) / f'{Path(filename).stem}_chapter_{i}_{voice_tag}_{xhtml_file_name}.wav'
         chapter_wav_files.append(chapter_wav_path)
         if Path(chapter_wav_path).exists():
             print(f'File for chapter {i} already exists. Skipping')
             stats.processed_chars += len(text)
+            # On a resumed run this existing wav already contains the prepended intro, so mark the intro
+            # consumed — otherwise it gets re-attached (and re-spoken) on the next synthesized chapter.
+            if len(text.strip()) >= 10:
+                intro_added = True
             if post_event:
                 post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
             continue
@@ -191,9 +204,16 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             print(f'Warning: No audio generated for chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
 
-    if has_ffmpeg:
+    if not chapter_wav_files:
+        print('No chapters were synthesized — nothing to assemble into an audiobook.')
+    elif has_ffmpeg:
         create_m4b(chapter_wav_files, filename, cover_image, output_folder, title=title, creator=creator)
-        if post_event: post_event('CORE_FINISHED')
+    else:
+        print('\033[91m' + 'Skipping m4b creation (ffmpeg not found). Your .wav chapter files are in the '
+              'output folder; install ffmpeg to assemble them into an .m4b.' + '\033[0m')
+    # Always emit the terminal event, even when m4b creation was skipped — otherwise the GUI hangs forever
+    # waiting on CORE_FINISHED. The .wav chapter files are still a valid result.
+    if post_event: post_event('CORE_FINISHED')
 
 
 def find_cover(book):
@@ -253,13 +273,17 @@ def build_synthesizer(voice: str, backend: str = 'cpu'):
     if backend not in backends.BACKENDS:
         raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
     info = backends.BACKENDS[backend]
-    lang_code = voice[0]
+    # Resolve the voice spec (single id, preset blend, or 'a:60,b:40' custom blend) into
+    # a language code + an engine-ready voice string. Blends are encoded as repetition in
+    # the comma string, which both Kokoro engines average identically (see voices.py).
+    lang_code = voicelib.voice_lang_code(voice)
+    kokoro_voice = voicelib.kokoro_voice_string(voice)
     if info.engine == 'mlx':
         if not backends._mlx_importable():
             raise RuntimeError(
                 "Backend 'mlx' requires mlx-audio on Apple Silicon. "
                 'Install it with: pip install "audiblez[mlx]"')
-        return _build_mlx_synth(voice, lang_code)
+        return _build_mlx_synth(kokoro_voice, lang_code)
     # torch path (cpu/cuda/rocm/mps): KPipeline's device= does a proper model .to(device),
     # which (unlike a global torch.set_default_device) actually works on MPS and avoids
     # mutating process-wide torch state.
@@ -267,7 +291,7 @@ def build_synthesizer(voice: str, backend: str = 'cpu'):
 
     def synth(text, speed):
         return [to_numpy(audio)
-                for _gs, _ps, audio in pipeline(text, voice=voice, speed=speed, split_pattern=r'\n\n\n')]
+                for _gs, _ps, audio in pipeline(text, voice=kokoro_voice, speed=speed, split_pattern=r'\n\n\n')]
     return synth
 
 
@@ -291,7 +315,7 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
     nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
-    lang_code = voice[0]
+    lang_code = voicelib.voice_lang_code(voice)
 
     if lang_code in 'ab':
         sentences = [s.text for s in doc.sents]
@@ -480,7 +504,9 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, title='', cr
     try:
         with open(wav_list_txt, 'w') as f:
             for wav_file in chapter_files:
-                f.write(f"file '{_escape_concat_path(wav_file)}'\n")
+                # Absolute paths: ffmpeg's concat demuxer resolves relative entries against the LIST file's
+                # directory (not the cwd), so a relative output_folder would double-prefix and fail.
+                f.write(f"file '{_escape_concat_path(Path(wav_file).resolve())}'\n")
 
         chapters_txt_path = create_index_file(title, creator, chapter_files, output_folder)
 

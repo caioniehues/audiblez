@@ -34,6 +34,29 @@ class BuildSynthesizerTest(unittest.TestCase):
             core.build_synthesizer('af_sky', 'rocm')
             self.assertEqual(kp.call_args.kwargs.get('device'), 'cuda')
 
+    def test_preset_blend_resolves_lang_and_blend_string(self):
+        fake_audio = np.zeros(4, dtype=np.float32)
+        fake_pipeline = mock.MagicMock(return_value=[('g', 'p', fake_audio)])
+        with mock.patch.object(core, 'KPipeline', return_value=fake_pipeline) as kp:
+            synth = core.build_synthesizer('af_warm', 'cpu')  # Heart + Bella
+            self.assertEqual(kp.call_args.kwargs.get('lang_code'), 'a')
+            synth('hello world', 1.0)
+            # The comma blend string is what both Kokoro engines average.
+            self.assertEqual(fake_pipeline.call_args.kwargs.get('voice'), 'af_heart,af_bella')
+
+    def test_weighted_blend_passes_repetition_string(self):
+        fake_audio = np.zeros(4, dtype=np.float32)
+        fake_pipeline = mock.MagicMock(return_value=[('g', 'p', fake_audio)])
+        with mock.patch.object(core, 'KPipeline', return_value=fake_pipeline):
+            synth = core.build_synthesizer('af_bella:60,af_heart:40', 'cpu')
+            synth('hello world', 1.0)
+            self.assertEqual(fake_pipeline.call_args.kwargs.get('voice'),
+                             'af_bella,af_bella,af_bella,af_heart,af_heart')
+
+    def test_unknown_voice_raises_valueerror(self):
+        with self.assertRaises(ValueError):
+            core.build_synthesizer('af_nonexistent', 'cpu')
+
     def test_unknown_backend_raises_valueerror(self):
         with self.assertRaises(ValueError):
             core.build_synthesizer('af_sky', 'bogus')

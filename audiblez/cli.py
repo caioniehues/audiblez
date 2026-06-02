@@ -2,22 +2,25 @@
 import argparse
 import sys
 
-from audiblez.voices import voices, available_voices_str
+from audiblez import voices as voicelib
 from audiblez import backends
 
 
 def cli_main():
-    voices_str = ', '.join(voices)
-    epilog = ('example:\n' +
-              '  audiblez book.epub -v af_sky -b mlx\n\n' +
+    epilog = ('examples:\n' +
+              '  audiblez book.epub -v af_heart           # best-quality default voice\n' +
+              '  audiblez book.epub -v af_warm -b mlx     # a curated "house narrator" blend\n' +
+              "  audiblez book.epub -v 'af_bella:60,af_heart:40'  # your own weighted blend\n\n" +
               'to run GUI just run:\n'
               '  audiblez-ui\n\n' +
               'available voices:\n' +
-              available_voices_str)
-    default_voice = 'af_sky'
+              voicelib.available_voices_str)
     parser = argparse.ArgumentParser(epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('epub_file_path', help='Path to the epub file')
-    parser.add_argument('-v', '--voice', default=default_voice, help=f'Choose narrating voice: {voices_str}')
+    parser.add_argument('-v', '--voice', default=voicelib.DEFAULT_VOICE,
+                        help=(f'Narrating voice (default: {voicelib.DEFAULT_VOICE}). A voice id '
+                              f'(e.g. af_heart), a preset blend ({", ".join(voicelib.PRESET_BLENDS)}), '
+                              "or a custom blend like 'af_bella:60,af_heart:40'. See the list below."))
     parser.add_argument('-p', '--pick', default=False, help=f'Interactively select which chapters to read in the audiobook', action='store_true')
     parser.add_argument('-s', '--speed', default=1.0, help=f'Set speed from 0.5 to 2.0', type=float)
     parser.add_argument('-b', '--backend', choices=backends.BACKEND_IDS, default=None,
@@ -31,6 +34,13 @@ def cli_main():
         parser.print_help(sys.stderr)
         sys.exit(1)
     args = parser.parse_args()
+
+    # Validate the voice/blend spec up front for a clean error (instead of a deep
+    # traceback at synthesis time). Pure-Python, keeps the --help path torch-free.
+    try:
+        voicelib.parse_voice_spec(args.voice)
+    except ValueError as e:
+        parser.error(str(e))
 
     avail = backends.available_backends()
     if args.backend is not None:
@@ -47,9 +57,16 @@ def cli_main():
         backend = 'cpu'  # bare invocation stays on CPU (unchanged default behavior)
 
     if backend not in avail:
-        print(f'Backend {backend!r} not available on this machine (have: {", ".join(avail)}). '
-              'Falling back to cpu.')
-        backend = 'cpu'
+        # A torch wheel exposes the GPU as EITHER 'cuda' (NVIDIA) or 'rocm' (AMD/HIP), never both. A user
+        # who asks for one when the build provides the other still wants their GPU, so map across first.
+        sibling = {'cuda': 'rocm', 'rocm': 'cuda'}.get(backend)
+        if sibling in avail:
+            print(f'{backend!r} requested, but this torch build exposes the GPU as {sibling!r}; using {sibling}.')
+            backend = sibling
+        else:
+            print(f'Backend {backend!r} not available on this machine (have: {", ".join(avail)}). '
+                  'Falling back to cpu.')
+            backend = 'cpu'
 
     print(f'Using {backends.BACKENDS[backend].label} backend')
     from audiblez.core import main

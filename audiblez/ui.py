@@ -16,7 +16,8 @@ from PIL import Image
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 
-from audiblez.voices import voices, flags
+from audiblez.voices import (voices, flags, VOICE_QUALITY, RECOMMENDED_VOICES,
+                             PRESET_BLEND_INFO, DEFAULT_VOICE, parse_voice_spec, grade_rank)
 from audiblez import backends
 
 EVENTS = {
@@ -299,17 +300,35 @@ class MainWindow(wx.Frame):
         sizer.Add(engine_label, pos=(0, 0), flag=wx.ALL, border=border)
         sizer.Add(engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
 
-        # Create a list of voices with flags
-        flag_and_voice_list = []
-        for code, l in voices.items():
-            for v in l:
-                flag_and_voice_list.append(f'{flags[code]} {v}')
+        # Voice picker. Recommended single voices and curated "house narrator" blends are
+        # surfaced first, then every voice annotated with its Kokoro quality grade and sorted
+        # best-first within each language. A label->spec map keeps selection robust; the combo
+        # is editable, so a user can also TYPE a custom blend (e.g. 'af_bella:60,af_heart:40').
+        self.voice_label_to_spec = {}
+        voice_choices = []
+
+        def add_voice_choice(label, spec):
+            if label in self.voice_label_to_spec:
+                return
+            self.voice_label_to_spec[label] = spec
+            voice_choices.append(label)
+
+        for v in RECOMMENDED_VOICES:
+            g = VOICE_QUALITY.get(v, '')
+            add_voice_choice(f'⭐ {flags[v[0]]} {v}' + (f'  ({g})' if g else ''), v)
+        for name, desc in PRESET_BLEND_INFO.items():
+            add_voice_choice(f'🎙️ {name} — {desc}', name)
+        for code, vlist in voices.items():
+            for v in sorted(vlist, key=lambda x: (grade_rank(VOICE_QUALITY.get(x, '')), x)):
+                g = VOICE_QUALITY.get(v, '')
+                add_voice_choice(f'{flags[code]} {v}' + (f'  ({g})' if g else ''), v)
 
         voice_label = wx.StaticText(panel, label="Voice:")
-        default_voice = flag_and_voice_list[0]
-        self.selected_voice = default_voice
-        voice_dropdown = wx.ComboBox(panel, choices=flag_and_voice_list, value=default_voice)
+        self.selected_voice = DEFAULT_VOICE
+        default_label = next(lbl for lbl, spec in self.voice_label_to_spec.items() if spec == DEFAULT_VOICE)
+        voice_dropdown = wx.ComboBox(panel, choices=voice_choices, value=default_label)
         voice_dropdown.Bind(wx.EVT_COMBOBOX, self.on_select_voice)
+        voice_dropdown.Bind(wx.EVT_TEXT, self.on_select_voice)  # catch typed custom blends too
         sizer.Add(voice_label, pos=(1, 0), flag=wx.ALL, border=border)
         sizer.Add(voice_dropdown, pos=(1, 1), flag=wx.ALL, border=border)
 
@@ -379,7 +398,18 @@ class MainWindow(wx.Frame):
             self.output_folder_text_ctrl.SetValue(output_folder)
 
     def on_select_voice(self, event):
-        self.selected_voice = event.GetString()
+        # Map the chosen label back to its voice spec. If the user typed something not in the
+        # map, accept it as a raw spec only when it parses (e.g. 'af_bella:60,af_heart:40');
+        # otherwise keep the previous selection (ignores half-typed input).
+        choice = event.GetString()
+        spec = self.voice_label_to_spec.get(choice)
+        if spec is None:
+            try:
+                parse_voice_spec(choice)
+                spec = choice
+            except ValueError:
+                return
+        self.selected_voice = spec
 
     def on_select_speed(self, event):
         self.selected_speed = event.GetValue()  # SpinCtrlDouble -> bounded float
@@ -486,7 +516,7 @@ class MainWindow(wx.Frame):
         return panel
 
     def get_selected_voice(self):
-        return self.selected_voice.split(' ')[1]
+        return self.selected_voice  # already a resolved spec (id, preset name, or blend)
 
     def get_selected_speed(self):
         return float(self.selected_speed)
@@ -540,7 +570,7 @@ class MainWindow(wx.Frame):
     def on_start(self, event):
         self.synthesis_in_progress = True
         file_path = self.selected_file_path
-        voice = self.selected_voice.split(' ')[1]  # Remove the flag
+        voice = self.get_selected_voice()
         speed = float(self.selected_speed)
         selected_chapters = [chapter for chapter in self.document_chapters if chapter.is_selected]
         self.start_button.Disable()
