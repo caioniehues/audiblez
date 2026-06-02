@@ -132,7 +132,7 @@ it works on every backend, including the Apple-Silicon MLX engine.
 | Preset | Blend | Character |
 |---|---|---|
 | `af_warm` | Heart + Bella | warm, smooth natural female |
-| `af_expressive` | Heart + Nicole | expressive, intimate female |
+| `af_expressive` | Heart + Nicole (2:1) | expressive, intimate female |
 | `ab_storyteller` | Heart + Emma | neutral US/UK female storyteller |
 | `am_warm` | Michael + Fenrir | warm male |
 | `am_deep` | Puck + Onyx (2:1) | rich, low male baritone (~100 Hz) |
@@ -204,6 +204,9 @@ options:
                         Narration backend: cpu, cuda (NVIDIA), rocm (AMD), mps
                         (Apple Silicon), mlx (Apple Silicon native). Default: cpu.
   -o, --output FOLDER   Output folder for the audiobook and temporary files
+  --chapters CHAPTERS   Comma-separated list or N-M range of chapter indices to convert (e.g. '1,3,5' or '2-6')
+  --chapter-text-dir DIR
+                        Directory containing chapter_<i>.txt files that override the extracted chapter text
 
 examples:
   audiblez book.epub -v af_heart           # best-quality default voice

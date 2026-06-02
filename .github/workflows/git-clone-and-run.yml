@@ -48,4 +48,7 @@ jobs:
         run: audiblez book.epub
       - name: check book.m4b file exists in current directory
         run: Get-ChildItem -Path .\ -Filter *.m4b
+      - name: run hermetic unit tests
+        run: |
+          python -m pytest test/test_voices.py test/test_cli.py -v
 

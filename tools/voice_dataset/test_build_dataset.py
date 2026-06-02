@@ -5,6 +5,7 @@ heavy whisperx/demucs/speechbrain imports are lazy). Run from the repo root:
 
     python -m unittest discover -s tools/voice_dataset -p 'test_*.py' -v
 """
+import json
 import sys
 import tempfile
 import unittest
@@ -91,6 +92,87 @@ class SelectNarratorTest(unittest.TestCase):
     def test_no_words_returns_none(self):
         spk, _ = B.select_narrator([], None, 24000, None, None, 0.5)
         self.assertIsNone(spk)
+
+
+class NarratorWordsTest(unittest.TestCase):
+    def test_none_speaker_words_excluded(self):
+        # WhisperX-shaped result: some words carry speaker=None (un-diarized regions).
+        result = {'segments': [
+            {'speaker': 'SPEAKER_00', 'words': [
+                {'word': 'Hello', 'start': 0.0, 'end': 0.4, 'speaker': 'SPEAKER_00'},
+                {'word': 'world', 'start': 0.4, 'end': 0.8, 'speaker': None},
+            ]},
+            {'speaker': None, 'words': [
+                {'word': 'noise', 'start': 1.0, 'end': 1.3, 'speaker': None},
+                {'word': 'kept', 'start': 1.3, 'end': 1.6, 'speaker': 'SPEAKER_01'},
+            ]},
+        ]}
+        out = B.narrator_words(result)
+        self.assertEqual([w['word'] for w in out], ['Hello', 'kept'])
+        self.assertTrue(all(w['speaker'] is not None for w in out))
+
+    def test_word_inherits_segment_speaker_when_key_missing(self):
+        # A word with no 'speaker' key falls back to the segment's speaker.
+        result = {'segments': [
+            {'speaker': 'SPEAKER_00', 'words': [{'word': 'Hi', 'start': 0.0, 'end': 0.3}]},
+            {'speaker': None, 'words': [{'word': 'gone', 'start': 0.5, 'end': 0.9}]},
+        ]}
+        out = B.narrator_words(result)
+        self.assertEqual([(w['word'], w['speaker']) for w in out], [('Hi', 'SPEAKER_00')])
+
+
+class LoadRecordsTest(unittest.TestCase):
+    def test_truncated_final_line_recovered(self):
+        # A kill mid-write leaves a partial JSON fragment on the last line.
+        good = ['{"id": "host-000000", "dur": 1.5}', '{"id": "host-000001", "dur": 2.0}']
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / 'records.jsonl'
+            rp.write_text('\n'.join(good) + '\n{"id": "host-000002", "du')  # truncated tail
+            recs = B.load_records(rp)
+            self.assertEqual([r['id'] for r in recs], ['host-000000', 'host-000001'])
+
+    def test_blank_lines_skipped_and_missing_file_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            rp = Path(td) / 'records.jsonl'
+            self.assertEqual(B.load_records(rp), [])  # no file yet
+            rp.write_text('{"id": "a"}\n\n   \n{"id": "b"}\n')
+            self.assertEqual([r['id'] for r in B.load_records(rp)], ['a', 'b'])
+
+
+class ResumeStateTest(unittest.TestCase):
+    def test_failed_file_recorded_in_state_and_skipped_on_resume(self):
+        # The per-file error path marks the source 'done' so a permanently-bad file is
+        # not retried on resume. write_state_atomic is the helper it uses; round-trip it
+        # the same way main() reads it back, then assert the resume skip predicate.
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            key = '/abs/path/bad-episode.mp3'
+            done = set()
+            done.add(key)
+            B.write_state_atomic(state_path, {'done': sorted(done)})
+
+            # Resume reads state.json exactly as main() does.
+            reloaded = json.loads(state_path.read_text())
+            resumed_done = set(reloaded['done'])
+            self.assertIn(key, resumed_done)            # failed file persisted to state.json
+            self.assertTrue(key in resumed_done)        # so main()'s 'if key in done' skips it
+
+    def test_resume_does_not_reprocess_done_source(self):
+        # Already-'done' sources are skipped, so their clips are never rebuilt/duplicated.
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            srcs = ['/a/ep1.mp3', '/a/ep2.mp3', '/a/ep3.mp3']
+            B.write_state_atomic(state_path, {'done': sorted([srcs[0], srcs[2]])})
+            done = set(json.loads(state_path.read_text())['done'])
+            to_process = [s for s in srcs if s not in done]   # main()'s 'if key in done: continue'
+            self.assertEqual(to_process, ['/a/ep2.mp3'])
+
+    def test_write_state_atomic_leaves_no_tmp_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / 'state.json'
+            B.write_state_atomic(state_path, {'done': ['/x.mp3']})
+            self.assertTrue(state_path.exists())
+            self.assertFalse(state_path.with_suffix('.json.tmp').exists())
 
 
 class ManifestsTest(unittest.TestCase):

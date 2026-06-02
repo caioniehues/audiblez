@@ -9,9 +9,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 try:
+    import numpy as np
     import audiblez.core as core
     _ERR = None
 except Exception as e:  # heavy deps (torch/kokoro/spacy) may be absent
@@ -80,6 +82,65 @@ class CreateM4bTest(unittest.TestCase):
                     core.create_m4b(wavs, 'book.epub', b'', d)
             # the wav-list temp file is removed in the finally block even on failure
             self.assertFalse((Path(d) / 'book_wav_list.txt').exists())
+
+    def test_concat_list_escapes_apostrophe_in_wav_filename(self):
+        # Regression: a wav filename containing an apostrophe must be written to the concat list using
+        # ffmpeg's close/escape/reopen form ('\'') so the single-quoted `file '<path>'` entry parses.
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            wav_list = args[args.index('-i') + 1]
+            captured['list'] = Path(wav_list).read_text()
+            return mock.Mock(returncode=0, stderr='')
+
+        with tempfile.TemporaryDirectory() as d:
+            wav = Path(d) / "ch1 o'brien.wav"  # apostrophe in the chapter name
+            wav.write_bytes(b'RIFF')
+            with mock.patch.object(core, 'probe_duration', return_value=1.0), \
+                 mock.patch('audiblez.core.subprocess.run', side_effect=fake_run):
+                core.create_m4b([wav], 'book.epub', b'', d)
+
+        # The escape form is exactly what _escape_concat_path produces for the resolved path.
+        expected = core._escape_concat_path(wav.resolve())
+        self.assertIn("'\\''", expected)                       # apostrophe became close/escape/reopen
+        self.assertIn(f"file '{expected}'\n", captured['list'])  # and that is the concat entry verbatim
+
+
+@unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
+class ChapterFilenameSanitizationTest(unittest.TestCase):
+    def test_malicious_get_name_yields_safe_wav_path(self):
+        # Regression: get_name() comes from the attacker-controllable epub manifest href. A raw newline or
+        # slash would break out of the ffmpeg concat list, so main() whitelist-sanitizes it into the wav name.
+        # Drive main() with everything heavy mocked; capture the chapter_wav_path passed to soundfile.write.
+        written = []
+        chapter = SimpleNamespace(
+            extracted_text='This is a long enough chapter body to be synthesized.',
+            chapter_index=0,
+            get_name=lambda: 'chapter/1\ninjected')
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(core, 'load_spacy'), \
+                 mock.patch.object(core, 'epub') as ep, \
+                 mock.patch.object(core, 'extract_book_metadata', return_value=('T', 'A')), \
+                 mock.patch.object(core, 'find_cover', return_value=None), \
+                 mock.patch.object(core, 'find_document_chapters_and_extract_texts', return_value=[chapter]), \
+                 mock.patch.object(core, 'find_good_chapters', return_value=[chapter]), \
+                 mock.patch.object(core, 'set_espeak_library'), \
+                 mock.patch.object(core, 'build_synthesizer', return_value=lambda *a, **k: []), \
+                 mock.patch.object(core, 'gen_audio_segments',
+                                   return_value=[np.zeros(4, dtype=np.float32)]), \
+                 mock.patch.object(core, 'shutil') as sh, \
+                 mock.patch.object(core, 'soundfile') as sf:
+                ep.read_epub.return_value = object()
+                sh.which.return_value = None  # no ffmpeg -> no m4b assembly, isolate the wav-path logic
+                sf.write.side_effect = lambda path, *a, **k: written.append(Path(path))
+                core.main('book.epub', 'af_heart', False, 1.0, output_folder=d)
+
+        self.assertEqual(len(written), 1)
+        name = written[0].name
+        self.assertNotIn('\n', name)   # newline stripped by the re.sub whitelist
+        self.assertNotIn('/', name)    # slash stripped too (would escape the concat list / path)
+        self.assertIn('chapter_1_injected', name)  # 'chapter/1\ninjected' -> 'chapter_1_injected'
 
 
 if __name__ == '__main__':

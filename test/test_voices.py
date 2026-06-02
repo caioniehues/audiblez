@@ -120,5 +120,58 @@ class IsBlendTest(unittest.TestCase):
         self.assertTrue(v.is_blend('af_warm'))
 
 
+class BlendWeightSafetyTest(unittest.TestCase):
+    """Regression tests pinning the blend-weight hardening (no non-positive
+    weights, bounded comma expansion, defined duplicate semantics)."""
+
+    def test_zero_weight_raises(self):
+        with self.assertRaises(ValueError):
+            v.parse_voice_spec('af_bella:0,af_heart:40')
+
+    def test_negative_weight_raises(self):
+        with self.assertRaises(ValueError):
+            v.parse_voice_spec('af_bella:-5,af_heart:40')
+
+    def test_extreme_numerator_is_capped_not_unbounded(self):
+        # 'af_bella:1000000,af_heart:1' would naively expand to ~1M comma parts
+        # (~500GB of voicepacks) and OOM. The rescale clamps each voice's count
+        # to MAX_BLEND_PARTS (a positive weight is floored at 1, never dropped),
+        # so the comma string can never explode — its part count is bounded by
+        # the cap plus at most one extra part per distinct voice.
+        spec = 'af_bella:1000000,af_heart:1'
+        comps = v.parse_voice_spec(spec)
+        for _, weight in comps:
+            self.assertLessEqual(weight, v.MAX_BLEND_PARTS)
+        parts = v.kokoro_voice_string(spec).split(',')
+        self.assertLessEqual(len(parts), v.MAX_BLEND_PARTS + len(comps))
+        # Both voices survive the rescale (no positive weight dropped to zero).
+        self.assertIn('af_bella', parts)
+        self.assertIn('af_heart', parts)
+
+    def test_near_equal_coprime_weights_stay_bounded(self):
+        # 33:33:34 are pairwise near-equal coprime integers; a naive LCM/GCD
+        # reduction keeps them at ~100 parts. They must collapse to ~1:1:1.
+        comps = v.parse_voice_spec('af_heart:33,af_bella:33,af_nicole:34')
+        total_weight = sum(w for _, w in comps)
+        self.assertLess(total_weight, 100)
+        self.assertLessEqual(total_weight, v.MAX_BLEND_PARTS)
+        self.assertEqual(len(v.kokoro_voice_string('af_heart:33,af_bella:33,af_nicole:34').split(',')),
+                         total_weight)
+
+    def test_duplicate_voice_id_sums_weights(self):
+        # A voice repeated in a blend sums its weights into one component rather
+        # than double-counting it as two separate parts; first-seen order kept.
+        self.assertEqual(v.parse_voice_spec('af_heart:60,af_heart:40'), [('af_heart', 1)])
+        self.assertEqual(
+            v.parse_voice_spec('af_bella:30,af_heart:40,af_bella:30'),
+            [('af_bella', 3), ('af_heart', 2)])
+
+
+class GradeRankUngradedTest(unittest.TestCase):
+    def test_ungraded_sorts_last(self):
+        self.assertEqual(v.grade_rank(''), 99)
+        self.assertGreater(v.grade_rank(''), v.grade_rank('F'))
+
+
 if __name__ == '__main__':
     unittest.main()
