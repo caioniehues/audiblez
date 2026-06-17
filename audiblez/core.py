@@ -38,6 +38,11 @@ VALIDATION_MAX_CHARS_PER_SEC = 30
 EWMA_ALPHA = 0.3       # weight of the newest measurement in the rolling chars/sec ETA
 HEARTBEAT_EVERY = 10   # emit a progress heartbeat line every N synthesized sentences
 
+# Batch multiple sentences into one synth() call (Kokoro re-splits on \n\n\n internally),
+# trading per-call Python/model overhead for throughput. Set to a tiny value to disable
+# batching and fall back to one sentence per call.
+BATCH_MAX_CHARS = 1000
+
 
 def to_numpy(audio):
     """Normalise a kokoro audio segment to a 1-D numpy array.
@@ -312,8 +317,28 @@ def _update_eta(stats, measured_chars, elapsed):
     stats.eta = strfdelta(remaining_chars / (stats.chars_per_sec or 1))
 
 
+def pack_sentences(sentences, batch_max_chars=BATCH_MAX_CHARS):
+    """Group consecutive sentences into batches of at most ``batch_max_chars`` chars.
+
+    A batch is joined with ``\\n\\n\\n`` and handed to synth in one call. A single
+    sentence longer than the cap becomes its own (oversized) batch rather than being
+    dropped or merged — preserving the per-sentence fallback for long sentences.
+    Order is always preserved, so chapter audio concatenates identically.
+    """
+    batches, current, current_len = [], [], 0
+    for s in sentences:
+        if current and current_len + len(s) > batch_max_chars:
+            batches.append(current)
+            current, current_len = [], 0
+        current.append(s)
+        current_len += len(s)
+    if current:
+        batches.append(current)
+    return batches
+
+
 def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
-                       chapter_label=None):
+                       chapter_label=None, batch_max_chars=BATCH_MAX_CHARS):
     nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
@@ -332,16 +357,21 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
             else:
                 sentences.append(sent.text)
 
-    for i, sent_text in enumerate(sentences):
-        if max_sentences and i >= max_sentences: break
+    if max_sentences:
+        sentences = sentences[:max_sentences]
+
+    for batch in pack_sentences(sentences, batch_max_chars):
         t0 = time.time()
-        audio_segments.extend(synth(sent_text, speed))
+        # Kokoro re-splits on \n\n\n, yielding one audio segment per sentence, in order.
+        audio_segments.extend(synth('\n\n\n'.join(batch), speed))
         elapsed = time.time() - t0
         if stats:
-            _update_eta(stats, len(sent_text), elapsed)
-            stats.sentences_done = getattr(stats, 'sentences_done', 0) + 1
+            before = getattr(stats, 'sentences_done', 0)
+            _update_eta(stats, sum(len(s) for s in batch), elapsed)
+            stats.sentences_done = before + len(batch)
             if post_event: post_event('CORE_PROGRESS', stats=stats)
-            if stats.sentences_done % HEARTBEAT_EVERY == 0:
+            # Heartbeat when this batch crossed a HEARTBEAT_EVERY boundary.
+            if stats.sentences_done // HEARTBEAT_EVERY > before // HEARTBEAT_EVERY:
                 where = f' [{chapter_label}]' if chapter_label else ''
                 print(f'♥ heartbeat{where}: {stats.sentences_done} sentences, '
                       f'{stats.chars_per_sec:.0f} chars/sec (measured), ETA {stats.eta}')
