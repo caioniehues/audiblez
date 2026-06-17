@@ -35,6 +35,9 @@ CPU_CHARS_PER_SEC = 50
 # short to be a complete chapter. Deliberately generous to avoid deleting valid wavs.
 VALIDATION_MAX_CHARS_PER_SEC = 30
 
+EWMA_ALPHA = 0.3       # weight of the newest measurement in the rolling chars/sec ETA
+HEARTBEAT_EVERY = 10   # emit a progress heartbeat line every N synthesized sentences
+
 
 def to_numpy(audio):
     """Normalise a kokoro audio segment to a 1-D numpy array.
@@ -133,6 +136,9 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     stats = SimpleNamespace(
         total_chars=sum(map(len, texts)),
         processed_chars=0,
+        sentences_done=0,
+        # Flat constant is only the initial prior; the real rate is measured per
+        # sentence and folded into an EWMA as synthesis proceeds (see _update_eta).
         chars_per_sec=GPU_CHARS_PER_SEC if backends.is_gpu(backend) else CPU_CHARS_PER_SEC)
     print('Started at:', time.strftime('%H:%M:%S'))
     print(f'Total characters: {stats.total_chars:,}')
@@ -174,7 +180,8 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
-            synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
+            synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences,
+            chapter_label=f'chapter {i}')
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -284,7 +291,29 @@ def _build_mlx_synth(voice: str, lang_code: str):
     return synth
 
 
-def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None):
+def ewma(prev, sample, alpha=EWMA_ALPHA):
+    """Exponentially-weighted moving average of a throughput sample.
+
+    ``prev`` is the previous estimate (e.g. the flat GPU/CPU_CHARS_PER_SEC prior on the
+    first call); ``None`` seeds the average with the first real sample.
+    """
+    if prev is None:
+        return sample
+    return alpha * sample + (1 - alpha) * prev
+
+
+def _update_eta(stats, measured_chars, elapsed):
+    """Fold one measurement into stats: rolling chars/sec, progress %, and ETA string."""
+    stats.processed_chars += measured_chars
+    if elapsed and elapsed > 0:
+        stats.chars_per_sec = ewma(getattr(stats, 'chars_per_sec', None), measured_chars / elapsed)
+    stats.progress = min(100, stats.processed_chars * 100 // stats.total_chars) if stats.total_chars else 100
+    remaining_chars = max(0, stats.total_chars - stats.processed_chars)  # intro chars can overshoot
+    stats.eta = strfdelta(remaining_chars / (stats.chars_per_sec or 1))
+
+
+def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
+                       chapter_label=None):
     nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
@@ -305,12 +334,17 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
 
     for i, sent_text in enumerate(sentences):
         if max_sentences and i >= max_sentences: break
+        t0 = time.time()
         audio_segments.extend(synth(sent_text, speed))
+        elapsed = time.time() - t0
         if stats:
-            stats.processed_chars += len(sent_text)
-            stats.progress = min(100, stats.processed_chars * 100 // stats.total_chars) if stats.total_chars else 100
-            stats.eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
+            _update_eta(stats, len(sent_text), elapsed)
+            stats.sentences_done = getattr(stats, 'sentences_done', 0) + 1
             if post_event: post_event('CORE_PROGRESS', stats=stats)
+            if stats.sentences_done % HEARTBEAT_EVERY == 0:
+                where = f' [{chapter_label}]' if chapter_label else ''
+                print(f'♥ heartbeat{where}: {stats.sentences_done} sentences, '
+                      f'{stats.chars_per_sec:.0f} chars/sec (measured), ETA {stats.eta}')
             print(f'Estimated time remaining: {stats.eta}')
             print('Progress:', f'{stats.progress}%\n')
     return audio_segments
