@@ -30,6 +30,11 @@ MAX_SENTENCE_LENGTH = 400  # chars; Kokoro truncates long non-English sentences,
 GPU_CHARS_PER_SEC = 500    # rough synthesis throughput, used only for the ETA display
 CPU_CHARS_PER_SEC = 50
 
+# Truncation floor for validate-before-skip: no real narration packs more than this
+# many characters into a second of audio, so anything shorter than text/this is too
+# short to be a complete chapter. Deliberately generous to avoid deleting valid wavs.
+VALIDATION_MAX_CHARS_PER_SEC = 30
+
 
 def to_numpy(audio):
     """Normalise a kokoro audio segment to a 1-D numpy array.
@@ -146,11 +151,17 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         chapter_wav_path = Path(output_folder) / f'{Path(filename).stem}_chapter_{i}_{voice}_{xhtml_file_name}.wav'
         chapter_wav_files.append(chapter_wav_path)
         if Path(chapter_wav_path).exists():
-            print(f'File for chapter {i} already exists. Skipping')
-            stats.processed_chars += len(text)
-            if post_event:
-                post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
-            continue
+            # Only skip if the existing wav is actually usable — a truncated/zero-byte
+            # file from a prior crash must be regenerated, not reused into the m4b.
+            expected_len = None if max_sentences else len(text)
+            if is_valid_chapter_wav(chapter_wav_path, expected_len):
+                print(f'File for chapter {i} already exists. Skipping')
+                stats.processed_chars += len(text)
+                if post_event:
+                    post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
+                continue
+            print(f'Existing file for chapter {i} is invalid/truncated; regenerating.')
+            Path(chapter_wav_path).unlink(missing_ok=True)
         if len(text.strip()) < 10:
             print(f'Skipping empty chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
@@ -420,9 +431,44 @@ def probe_duration(file_name):
     try:
         proc = subprocess.run(args, capture_output=True, text=True, check=True)
         return float(proc.stdout.strip())
-    except (subprocess.CalledProcessError, ValueError) as e:
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+        # FileNotFoundError = ffprobe not on PATH; callers must degrade gracefully.
         print(f'Warning: could not probe duration of {file_name}: {e}')
         return None
+
+
+def is_valid_chapter_wav(path, expected_text_len, min_chars_per_sec=VALIDATION_MAX_CHARS_PER_SEC):
+    """Whether an existing chapter wav is safe to reuse instead of regenerating.
+
+    Guards the resume-by-skip path against truncated or zero-byte wavs left behind by
+    a prior crash, which would otherwise be silently piped into the final m4b. Checks,
+    in order of preference and degrading gracefully:
+      1. exists and is non-empty;
+      2. duration is plausible for the text — via ffprobe, falling back to soundfile's
+         header (when ffprobe is absent), then to a raw file-size floor;
+    ``expected_text_len`` of None means the caller capped output (``max_sentences``),
+    so the length is not comparable and only readability is required.
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return False
+
+    duration = probe_duration(p)
+    if duration is None:  # ffprobe missing/failed -> read the wav header directly
+        try:
+            duration = soundfile.info(str(p)).duration
+        except Exception:
+            duration = None
+
+    if duration is None:
+        # Can't measure duration at all: accept any file too big to be a bare header.
+        return p.stat().st_size > 1024
+    if duration <= 0:
+        return False
+    if expected_text_len is None:
+        return True  # length not comparable; readable + non-empty is enough
+    expected_min_sec = expected_text_len / min_chars_per_sec
+    return duration >= expected_min_sec * 0.5
 
 
 def create_index_file(title, creator, chapter_files, output_folder):
