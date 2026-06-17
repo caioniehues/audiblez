@@ -3,10 +3,6 @@
 # audiblez - A program to convert e-books into audiobooks using
 # Kokoro-82M model for high-quality text-to-speech synthesis.
 # by Claudio Santini 2025 - https://claudio.uk
-import os
-import traceback
-from glob import glob
-
 import spacy
 import ebooklib
 import soundfile
@@ -66,36 +62,18 @@ def load_spacy():
 
 
 def set_espeak_library():
-    """Find the espeak library path"""
-    try:
+    """Locate the espeak-ng library and register it with phonemizer.
 
-        if os.environ.get('ESPEAK_LIBRARY'):
-            library = os.environ['ESPEAK_LIBRARY']
-        elif platform.system() == 'Darwin':
-            from subprocess import check_output
-            try:
-                cellar = Path(check_output(["brew", "--cellar"], text=True).strip())
-                pattern = cellar / "espeak-ng" / "*" / "lib" / "*.dylib"
-                if not (library := next(iter(glob(str(pattern))), None)):
-                    raise RuntimeError("No espeak-ng library found; please set the path manually")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                raise RuntimeError("Cannot locate Homebrew Cellar. Is 'brew' installed and in PATH?") from e
-        elif platform.system() == 'Linux':
-            library = glob('/usr/lib/*/libespeak-ng*')[0]
-        elif platform.system() == 'Windows':
-            library = 'C:\\Program Files*\\eSpeak NG\\libespeak-ng.dll'
-        else:
-            print('Unsupported OS, please set the espeak library path manually')
-            return
-        print('Using espeak library:', library)
-        from phonemizer.backend.espeak.wrapper import EspeakWrapper
-        EspeakWrapper.set_library(library)
-    except Exception:
-        traceback.print_exc()
-        print("Error finding espeak-ng library:")
-        print("Probably you haven't installed espeak-ng.")
-        print("On Mac: brew install espeak-ng")
-        print("On Linux: sudo apt install espeak-ng")
+    Fails LOUD: the path resolution (delegated to :func:`audiblez.doctor.find_espeak_library`)
+    raises a ``RuntimeError`` with an actionable, OS-specific install hint instead of the
+    old swallow-and-continue, which used to let a run proceed for an hour and emit nothing.
+    Run ``audiblez --doctor`` to check this ahead of a long synthesis.
+    """
+    from audiblez.doctor import find_espeak_library
+    library = find_espeak_library()
+    print('Using espeak library:', library)
+    from phonemizer.backend.espeak.wrapper import EspeakWrapper
+    EspeakWrapper.set_library(library)
 
 
 def extract_book_metadata(book):
@@ -111,6 +89,14 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
          max_chapters: int | None = None, max_sentences: int | None = None,
          selected_chapters: list | None = None, backend: str = 'cpu', post_event=None) -> None:
     if post_event: post_event('CORE_STARTED')
+    # Fast preflight: abort in seconds with an actionable message rather than dying
+    # 40 minutes in on a missing dep. See `audiblez --doctor` for the same checks.
+    from audiblez import doctor
+    checks = doctor.run_checks(backend)
+    if any(c.status == 'fail' for c in checks):
+        print(doctor.format_report(checks))
+        failed = '; '.join(f'{c.name}: {c.detail}' for c in checks if c.status == 'fail')
+        raise RuntimeError(f'Preflight failed — fix these before synthesis: {failed}')
     load_spacy()
     if output_folder != '.':
         Path(output_folder).mkdir(parents=True, exist_ok=True)
