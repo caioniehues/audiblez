@@ -28,6 +28,14 @@ jobs:
           python -m unittest discover -s test -p 'test_backends.py' -v
           python -m unittest discover -s test -p 'test_synth.py' -v
           python -m unittest discover -s test -p 'test_cli.py' -v
+          python -m unittest discover -s test -p 'test_doctor.py' -v
+          python -m unittest discover -s test -p 'test_validation.py' -v
+          python -m unittest discover -s test -p 'test_eta.py' -v
+          python -m unittest discover -s test -p 'test_batching.py' -v
+          python -m unittest discover -s test -p 'test_resilience.py' -v
+          python -m unittest discover -s test -p 'test_trailer.py' -v
+          python -m unittest discover -s test -p 'test_lexicon.py' -v
+          python -m unittest discover -s test -p 'test_cache.py' -v
   windows-git-clone-and-run:
     runs-on: windows-latest
     steps:

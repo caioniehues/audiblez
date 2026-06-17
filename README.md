@@ -141,12 +141,37 @@ Sometimes you want to manually select which chapters/sections in the e-book to r
 To do so, you can use `--pick` to interactively choose the chapters to convert (without running the GUI).
 
 
+## Preview, recover & fine-tune
+
+A handful of commands help you trust a long run before (and after) committing the hour:
+
+```bash
+audiblez --doctor                       # preflight: ffmpeg, espeak-ng, spaCy, backend (add --deep to synth one word)
+audiblez book.epub --trailer            # render trailer.wav: opening lines of each chapter — audition voice + detection
+audiblez book.epub --seed-lexicon       # write book.lexicon.json of names/acronyms to respell; applied next run
+audiblez book.epub --cache              # cache synthesized sentences and reuse them on re-runs/Preview (opt-in)
+audiblez book.epub --merge              # rebuild a playable .m4b from chapters already synthesized (crash recovery)
+```
+
+- **`--doctor`** fails fast with a red/green report instead of dying 40 minutes in on a missing dependency.
+- **`--trailer`** lets you hear whether chapter detection, voice, and pronunciation are right in ~2 minutes.
+- **`--seed-lexicon`** seeds a per-book pronunciation sidecar (`<book>.lexicon.json`); edit the values to fix
+  recurring names/acronyms once. The GUI has a "📖 Pronunciations" editor and a "🗣️ Audition voice" button.
+- **`--cache`** stores each sentence's audio under `<output>/.audiblez_cache` and reuses it on the next run.
+- **`--merge`** stitches the chapter `.wav`s that already exist into an `.m4b`, so an interrupted run still yields
+  a playable audiobook.
+
+A bad sentence no longer aborts a chapter: synthesis retries, then splices a short silence and logs the failure
+to `<chapter>.failed.jsonl`. The ETA is measured from real throughput (not a flat guess) and prints a heartbeat.
+
 ## Help page
 
 For all the options available, you can check the help page `audiblez --help`:
 
 ```
-usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-b {cpu,cuda,rocm,mps,mlx}] [-o FOLDER] epub_file_path
+usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-b {cpu,cuda,rocm,mps,mlx}] [-o FOLDER]
+                [--doctor] [--deep] [--merge] [--trailer] [--seed-lexicon] [--cache]
+                [epub_file_path]
 
 positional arguments:
   epub_file_path        Path to the epub file
@@ -160,6 +185,12 @@ options:
                         Narration backend: cpu, cuda (NVIDIA), rocm (AMD), mps
                         (Apple Silicon), mlx (Apple Silicon native). Default: cpu.
   -o, --output FOLDER   Output folder for the audiobook and temporary files
+  --doctor              Run preflight checks (ffmpeg, espeak-ng, spaCy, backend) and exit
+  --deep                With --doctor: also load the model and synthesize one word (slow)
+  --merge               Assemble already-synthesized chapter wavs into an m4b and exit
+  --trailer             Render a short trailer.wav sampling the opening of each chapter and exit
+  --seed-lexicon        Write a <book>.lexicon.json of candidate names/acronyms to edit, then exit
+  --cache               Cache synthesized sentences and reuse them on re-runs/Preview (opt-in)
 
 example:
   audiblez book.epub -v af_sky -b mlx
