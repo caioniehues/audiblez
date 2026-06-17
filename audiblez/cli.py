@@ -30,6 +30,9 @@ def cli_main():
                         help='Run preflight checks (ffmpeg, espeak-ng, spaCy, selected backend) and exit')
     parser.add_argument('--deep', default=False, action='store_true',
                         help='With --doctor: also load the model and synthesize one word (slow)')
+    parser.add_argument('--merge', default=False, action='store_true',
+                        help='Assemble already-synthesized chapter wavs into an m4b and exit '
+                             '(recover a playable audiobook from an interrupted run)')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -45,6 +48,12 @@ def cli_main():
 
     if not args.epub_file_path:
         parser.error('the following arguments are required: epub_file_path (or use --doctor)')
+
+    # --merge needs no backend/model: just stitch existing chapter wavs into an m4b.
+    if args.merge:
+        from audiblez.core import merge_chapters
+        result = merge_chapters(args.epub_file_path, args.voice, args.output)
+        sys.exit(0 if result else 1)
 
     avail = backends.available_backends()
     if args.backend is not None:

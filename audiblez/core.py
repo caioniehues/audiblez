@@ -7,11 +7,13 @@ import spacy
 import ebooklib
 import soundfile
 import numpy as np
+import json
 import time
 import shutil
 import subprocess
 import platform
 import re
+from glob import glob
 from types import SimpleNamespace
 from tabulate import tabulate
 from pathlib import Path
@@ -42,6 +44,9 @@ HEARTBEAT_EVERY = 10   # emit a progress heartbeat line every N synthesized sent
 # trading per-call Python/model overhead for throughput. Set to a tiny value to disable
 # batching and fall back to one sentence per call.
 BATCH_MAX_CHARS = 1000
+
+SYNTH_RETRIES = 2                     # extra attempts after the first before giving up on a unit
+FALLBACK_SILENCE_CHARS_PER_SEC = 15   # gap length (proportional to text) for a dead-lettered sentence
 
 
 def to_numpy(audio):
@@ -184,9 +189,12 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             intro_added = True
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
+        # Fresh dead-letter per (re)generated chapter; failed sentences are appended here.
+        dead_letter_path = Path(chapter_wav_path).with_suffix('.failed.jsonl')
+        Path(dead_letter_path).unlink(missing_ok=True)
         audio_segments = gen_audio_segments(
             synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences,
-            chapter_label=f'chapter {i}')
+            chapter_label=f'chapter {i}', dead_letter_path=dead_letter_path)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -201,8 +209,15 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             chapter_wav_files.remove(chapter_wav_path)
 
     if has_ffmpeg:
-        create_m4b(chapter_wav_files, filename, cover_image, output_folder, title=title, creator=creator)
-        if post_event: post_event('CORE_FINISHED')
+        # Assemble only valid chapter audio, so one corrupt/short wav can't break the
+        # whole m4b; completed chapters always persist as wavs and can also be assembled
+        # later with `audiblez --merge` if the run is interrupted before this point.
+        valid_wavs = [w for w in chapter_wav_files if is_valid_chapter_wav(w, None)]
+        if valid_wavs:
+            create_m4b(valid_wavs, filename, cover_image, output_folder, title=title, creator=creator)
+            if post_event: post_event('CORE_FINISHED')
+        else:
+            print('No valid chapter audio to assemble into an m4b.')
 
 
 def find_cover(book):
@@ -337,8 +352,60 @@ def pack_sentences(sentences, batch_max_chars=BATCH_MAX_CHARS):
     return batches
 
 
+def _silence_for(text):
+    """A silent placeholder segment, length roughly proportional to the failed text."""
+    seconds = max(0.3, len(text) / FALLBACK_SILENCE_CHARS_PER_SEC)
+    return np.zeros(int(seconds * sample_rate), dtype=np.float32)
+
+
+def _retry(fn, retries):
+    """Call ``fn`` up to ``retries + 1`` times (at least once); return it or re-raise the last error."""
+    last = RuntimeError('no attempts made')
+    for _ in range(max(1, retries + 1)):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _record_dead_letter(path, chapter_label, text, error):
+    """Append one failed sentence to a chapter's ``.failed.jsonl`` dead-letter file."""
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'chapter': chapter_label, 'text': text, 'error': error},
+                               ensure_ascii=False) + '\n')
+    except OSError as e:
+        print(f'Warning: could not write dead-letter entry to {path}: {e}')
+
+
+def _synth_batch(synth, batch, speed, retries=SYNTH_RETRIES, chapter_label=None, dead_letter_path=None):
+    """Synthesize a batch of sentences, never raising for a single bad sentence.
+
+    Tries the whole batch in one call (with bounded retries). On persistent failure it
+    falls back to per-sentence synthesis; any sentence that still fails after its retries
+    is replaced with silence and recorded to a dead-letter file, so one bad sentence (or
+    a failed batched call) degrades to a gap instead of nuking the entire chapter.
+    """
+    try:
+        return _retry(lambda: synth('\n\n\n'.join(batch), speed), retries)
+    except Exception as e:
+        print(f'\033[91mBatch synth failed ({e}); retrying sentence-by-sentence.\033[0m')
+    segments = []
+    for s in batch:
+        try:
+            segments.extend(_retry(lambda s=s: synth(s, speed), retries))
+        except Exception as e:
+            print(f'\033[91mSentence failed after {retries + 1} attempts; inserting silence.\033[0m')
+            segments.append(_silence_for(s))
+            if dead_letter_path:
+                _record_dead_letter(dead_letter_path, chapter_label, s, str(e))
+    return segments
+
+
 def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
-                       chapter_label=None, batch_max_chars=BATCH_MAX_CHARS):
+                       chapter_label=None, batch_max_chars=BATCH_MAX_CHARS,
+                       synth_retries=SYNTH_RETRIES, dead_letter_path=None):
     nlp = load_spacy()
     audio_segments = []
     doc = nlp(text)
@@ -363,7 +430,10 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
     for batch in pack_sentences(sentences, batch_max_chars):
         t0 = time.time()
         # Kokoro re-splits on \n\n\n, yielding one audio segment per sentence, in order.
-        audio_segments.extend(synth('\n\n\n'.join(batch), speed))
+        # Bounded retries + per-sentence fallback so a bad sentence becomes a gap, not a crash.
+        audio_segments.extend(_synth_batch(synth, batch, speed, retries=synth_retries,
+                                           chapter_label=chapter_label,
+                                           dead_letter_path=dead_letter_path))
         elapsed = time.time() - t0
         if stats:
             before = getattr(stats, 'sentences_done', 0)
@@ -606,3 +676,45 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, title='', cr
         for tmp in (wav_list_txt, cover_file_path):
             if tmp is not None:
                 Path(tmp).unlink(missing_ok=True)
+
+
+def find_chapter_wavs(file_path, voice, output_folder='.'):
+    """Return existing chapter wavs for a book/voice, ordered by chapter index.
+
+    Matches the naming scheme used by :func:`main`
+    (``<stem>_chapter_<i>_<voice>_<xhtml>.wav``) and sorts on the integer ``<i>`` so
+    the merge order is the synthesis order, not lexicographic (chapter_10 after 9).
+    """
+    stem = Path(file_path).stem
+    matches = glob(str(Path(output_folder) / f'{stem}_chapter_*_{voice}_*.wav'))
+
+    def chapter_index(path):
+        m = re.search(rf'{re.escape(stem)}_chapter_(\d+)_', Path(path).name)
+        return int(m.group(1)) if m else 0
+
+    return [Path(p) for p in sorted(matches, key=chapter_index)]
+
+
+def merge_chapters(file_path, voice, output_folder='.'):
+    """Assemble already-synthesized chapter wavs into a playable m4b.
+
+    The recovery path for an interrupted run: completed chapters persist as wavs, so
+    even if synthesis (or the final mux) died partway, ``audiblez --merge`` stitches the
+    valid ones into an m4b. Pulls title/author/cover from the epub for metadata. Returns
+    the m4b path, or None if there is nothing valid to merge / ffmpeg is missing.
+    """
+    if not shutil.which('ffmpeg'):
+        print('\033[91mffmpeg not found; cannot merge chapters into an m4b.\033[0m')
+        return None
+    book = epub.read_epub(file_path)
+    title, creator = extract_book_metadata(book)
+    cover = find_cover(book)
+    cover_image = cover.get_content() if cover else b''
+    wavs = [w for w in find_chapter_wavs(file_path, voice, output_folder)
+            if is_valid_chapter_wav(w, None)]
+    if not wavs:
+        print('No completed/valid chapter wavs found to merge.')
+        return None
+    print(f'Merging {len(wavs)} completed chapter(s) into an m4b...')
+    return create_m4b(wavs, Path(file_path).name, cover_image, output_folder,
+                      title=title, creator=creator)
