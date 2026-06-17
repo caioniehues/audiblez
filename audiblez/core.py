@@ -48,6 +48,9 @@ BATCH_MAX_CHARS = 1000
 SYNTH_RETRIES = 2                     # extra attempts after the first before giving up on a unit
 FALLBACK_SILENCE_CHARS_PER_SEC = 15   # gap length (proportional to text) for a dead-lettered sentence
 
+TRAILER_SENTENCES_PER_CHAPTER = 2     # opening sentences sampled per chapter in --trailer
+TRAILER_GAP_SECONDS = 1.0             # silent gap between trailer segments
+
 
 def to_numpy(audio):
     """Normalise a kokoro audio segment to a 1-D numpy array.
@@ -461,6 +464,46 @@ def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False
     soundfile.write(output_file, final_audio, sample_rate)
     if play:
         subprocess.run(['ffplay', '-autoexit', '-nodisp', output_file])
+
+
+def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend='cpu',
+                 sentences_per_chapter=TRAILER_SENTENCES_PER_CHAPTER, selected_chapters=None,
+                 max_chapters=None):
+    """Render a short audio sampler of a book: the opening sentences of each chapter.
+
+    For each detected chapter, speaks a "Chapter N" label then its first
+    ``sentences_per_chapter`` sentences, separated by short silent gaps. Lets a user
+    hear in a couple of minutes whether chapter detection, voice, and pronunciation are
+    right BEFORE committing to a full hour-long synthesis — and audibly reveals a
+    misdetected chapter. Modeled on :func:`gen_text`; returns the output path (or None).
+    """
+    load_spacy()
+    book = epub.read_epub(file_path)
+    document_chapters = find_document_chapters_and_extract_texts(book)
+    chapters = selected_chapters or find_good_chapters(document_chapters)
+    synth = build_synthesizer(voice, backend)
+    gap = np.zeros(int(TRAILER_GAP_SECONDS * sample_rate), dtype=np.float32)
+
+    pieces, sampled = [], 0
+    for n, chapter in enumerate(chapters, start=1):
+        if max_chapters and sampled >= max_chapters:
+            break
+        text = chapter.extracted_text.strip()
+        if len(text) < 10:
+            continue
+        pieces.extend(gen_audio_segments(synth, f'Chapter {n}.', voice=voice, speed=speed))
+        pieces.append(gap)
+        pieces.extend(gen_audio_segments(synth, text, voice=voice, speed=speed,
+                                         max_sentences=sentences_per_chapter))
+        pieces.append(gap)
+        sampled += 1
+
+    if not pieces:
+        print('No chapters to put in the trailer.')
+        return None
+    soundfile.write(output_file, np.concatenate(pieces), sample_rate)
+    print(f'Trailer written to {output_file} ({sampled} chapter(s) sampled).')
+    return output_file
 
 
 def find_document_chapters_and_extract_texts(book):

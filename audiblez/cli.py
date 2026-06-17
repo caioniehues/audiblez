@@ -33,6 +33,9 @@ def cli_main():
     parser.add_argument('--merge', default=False, action='store_true',
                         help='Assemble already-synthesized chapter wavs into an m4b and exit '
                              '(recover a playable audiobook from an interrupted run)')
+    parser.add_argument('--trailer', default=False, action='store_true',
+                        help='Render a short trailer.wav sampling the opening of each chapter '
+                             'and exit (audition voice + chapter detection before a full run)')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -75,6 +78,15 @@ def cli_main():
         backend = 'cpu'
 
     print(f'Using {backends.BACKENDS[backend].label} backend')
+
+    # --trailer auditions voice + chapter detection cheaply before a full hour-long run.
+    if args.trailer:
+        import os
+        from audiblez.core import make_trailer
+        out = os.path.join(args.output, 'trailer.wav')
+        result = make_trailer(args.epub_file_path, args.voice, out, speed=args.speed, backend=backend)
+        sys.exit(0 if result else 1)
+
     from audiblez.core import main
     main(args.epub_file_path, args.voice, args.pick, args.speed, args.output, backend=backend)
 

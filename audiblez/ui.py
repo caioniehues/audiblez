@@ -310,8 +310,11 @@ class MainWindow(wx.Frame):
         self.selected_voice = default_voice
         voice_dropdown = wx.ComboBox(panel, choices=flag_and_voice_list, value=default_voice)
         voice_dropdown.Bind(wx.EVT_COMBOBOX, self.on_select_voice)
+        audition_button = wx.Button(panel, label="🗣️ Audition voice")
+        audition_button.Bind(wx.EVT_BUTTON, self.on_audition_voice)
         sizer.Add(voice_label, pos=(1, 0), flag=wx.ALL, border=border)
         sizer.Add(voice_dropdown, pos=(1, 1), flag=wx.ALL, border=border)
+        sizer.Add(audition_button, pos=(1, 2), flag=wx.ALL, border=border)
 
         # Speed: a spin control bounded to 0.5–2.0 (cannot accept invalid input)
         speed_label = wx.StaticText(panel, label="Speed:")
@@ -344,6 +347,11 @@ class MainWindow(wx.Frame):
         self.right_sizer.Add(panel_box, 1, wx.ALL | wx.EXPAND, 5)
         sizer = wx.BoxSizer(wx.VERTICAL)
         panel.SetSizer(sizer)
+
+        # Trailer: audition the whole book (chapter detection + voice) before committing.
+        self.trailer_button = wx.Button(panel, label="🎬 Preview whole book (trailer)")
+        self.trailer_button.Bind(wx.EVT_BUTTON, self.on_preview_book_trailer)
+        sizer.Add(self.trailer_button, 0, wx.ALL, 5)
 
         # Add Start button
         self.start_button = wx.Button(panel, label="🚀 Start Audiobook Synthesis")
@@ -491,51 +499,98 @@ class MainWindow(wx.Frame):
     def get_selected_speed(self):
         return float(self.selected_speed)
 
+    def _spawn_player(self, button, idle_label, produce_path):
+        """Run produce_path(core) -> wav path on a daemon thread, ffplay it, then clean up.
+
+        Shared by chapter preview, voice audition, and the book trailer so the off-UI
+        thread machinery (never join() on the UI thread — it freezes the GUI) lives once.
+        produce_path returns a path to a temporary wav to play, or None to skip.
+        """
+        button.SetLabel("⏳")
+        button.Disable()
+
+        def restore():
+            button.SetLabel(idle_label)
+            button.Enable()
+
+        def work():
+            path = None
+            try:
+                import audiblez.core as core
+                path = produce_path(core)
+                if path:
+                    subprocess.run(['ffplay', '-autoexit', '-nodisp', str(path)])
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                wx.CallAfter(restore)  # GUI mutations must run on the main thread
+
+        self.preview_threads = [t for t in self.preview_threads if t.is_alive()]
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        self.preview_threads.append(thread)
+
+    def _synth_to_temp(self, core, text, voice, speed):
+        """Synthesize text to a temp wav and return its path (or None if no audio)."""
+        synth = core.build_synthesizer(voice, getattr(self, 'selected_backend', 'cpu'))
+        core.load_spacy()
+        audio_segments = core.gen_audio_segments(synth, text, voice=voice, speed=speed)
+        if not audio_segments:
+            return None
+        with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            soundfile.write(tmp, np.concatenate(audio_segments), core.sample_rate)
+            return tmp.name
+
     def on_preview_chapter(self, event):
         button = event.GetEventObject()
         text = self.selected_chapter.extracted_text[:300]
         if len(text.strip()) == 0:
             return
-        voice = self.get_selected_voice()
-        speed = self.get_selected_speed()
-        button.SetLabel("⏳")
-        button.Disable()
+        voice, speed = self.get_selected_voice(), self.get_selected_speed()
+        self._spawn_player(button, "🔊 Preview",
+                           lambda core: self._synth_to_temp(core, text, voice, speed))
 
-        def restore_button():
-            button.SetLabel("🔊 Preview")
-            button.Enable()
+    def on_audition_voice(self, event):
+        # Speak the book's opening in the chosen voice — an audible casting step for the
+        # otherwise-cryptic voice dropdown.
+        button = event.GetEventObject()
+        chapter = self.selected_chapter
+        text = chapter.extracted_text[:300] if chapter else ''
+        if len(text.strip()) == 0:
+            return
+        voice, speed = self.get_selected_voice(), self.get_selected_speed()
+        self._spawn_player(button, "🗣️ Audition voice",
+                           lambda core: self._synth_to_temp(core, text, voice, speed))
 
-        def generate_preview():
-            tmp_path = None
-            try:
-                import audiblez.core as core
-                synth = core.build_synthesizer(voice, getattr(self, 'selected_backend', 'cpu'))
-                core.load_spacy()
-                audio_segments = core.gen_audio_segments(synth, text, voice=voice, speed=speed)
-                if not audio_segments:
-                    return
-                final_audio = np.concatenate(audio_segments)
-                with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                    tmp_path = tmp.name
-                    soundfile.write(tmp, final_audio, core.sample_rate)
-                subprocess.run(['ffplay', '-autoexit', '-nodisp', tmp_path])
-            except Exception:
-                import traceback
-                traceback.print_exc()
-            finally:
-                if tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                # GUI mutations must run on the main thread.
-                wx.CallAfter(restore_button)
+    def on_preview_book_trailer(self, event):
+        # Render a short sampler of every selected chapter's opening before committing.
+        button = event.GetEventObject()
+        file_path = self.selected_file_path
+        voice, speed = self.get_selected_voice(), self.get_selected_speed()
+        backend = getattr(self, 'selected_backend', 'cpu')
+        selected = [c for c in self.document_chapters if getattr(c, 'is_selected', False)] or None
 
-        # Drop finished threads; never join() on the UI thread (it freezes the GUI).
-        self.preview_threads = [t for t in self.preview_threads if t.is_alive()]
-        thread = threading.Thread(target=generate_preview, daemon=True)
-        thread.start()
-        self.preview_threads.append(thread)
+        def produce(core):
+            import tempfile
+            fd, name = tempfile.mkstemp(suffix='.wav')
+            os.close(fd)
+            result = core.make_trailer(file_path, voice, name, speed=speed, backend=backend,
+                                       selected_chapters=selected)
+            if not result:
+                try:
+                    os.unlink(name)
+                except OSError:
+                    pass
+                return None
+            return result
+
+        self._spawn_player(button, "🎬 Preview whole book (trailer)", produce)
 
     def on_start(self, event):
         self.synthesis_in_progress = True
