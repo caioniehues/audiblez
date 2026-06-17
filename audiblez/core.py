@@ -109,7 +109,8 @@ def extract_book_metadata(book):
 
 def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_folder: str = '.',
          max_chapters: int | None = None, max_sentences: int | None = None,
-         selected_chapters: list | None = None, backend: str = 'cpu', post_event=None) -> None:
+         selected_chapters: list | None = None, backend: str = 'cpu', post_event=None,
+         cache_dir: str | None = None) -> None:
     if post_event: post_event('CORE_STARTED')
     # Fast preflight: abort in seconds with an actionable message rather than dying
     # 40 minutes in on a missing dep. See `audiblez --doctor` for the same checks.
@@ -137,6 +138,14 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder))
     if lexicon.fingerprint(book_lexicon):
         print(f'Loaded pronunciation lexicon with {len(lexicon._active(book_lexicon))} override(s).')
+
+    # Opt-in per-sentence synth cache (KEYSTONE slice 1): reuse audio on re-runs/Preview.
+    synth_cache, cache_fields = None, None
+    if cache_dir:
+        from audiblez import cache as cache_mod
+        synth_cache = cache_mod.SynthCache(cache_dir)
+        cache_fields = _cache_key_fields(backend, voice, speed)
+        print(f'Sentence cache enabled at {cache_dir}')
 
     document_chapters = find_document_chapters_and_extract_texts(book)
 
@@ -205,7 +214,8 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         Path(dead_letter_path).unlink(missing_ok=True)
         audio_segments = gen_audio_segments(
             synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences,
-            chapter_label=f'chapter {i}', dead_letter_path=dead_letter_path)
+            chapter_label=f'chapter {i}', dead_letter_path=dead_letter_path,
+            cache=synth_cache, cache_key_fields=cache_fields)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -218,6 +228,9 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         else:
             print(f'Warning: No audio generated for chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
+
+    if synth_cache is not None:
+        print(f'Sentence cache: {synth_cache.stats()}')
 
     if has_ffmpeg:
         # Assemble only valid chapter audio, so one corrupt/short wav can't break the
@@ -414,29 +427,83 @@ def _synth_batch(synth, batch, speed, retries=SYNTH_RETRIES, chapter_label=None,
     return segments
 
 
+def _account(stats, n_sentences, chars, elapsed, post_event, chapter_label):
+    """Fold one synthesized unit (batch or sentence) into progress/ETA + heartbeat output.
+
+    ``elapsed`` of 0 (e.g. a cache hit) advances progress without polluting the measured
+    chars/sec EWMA, since no real synthesis happened.
+    """
+    if not stats:
+        return
+    before = getattr(stats, 'sentences_done', 0)
+    _update_eta(stats, chars, elapsed)
+    stats.sentences_done = before + n_sentences
+    if post_event: post_event('CORE_PROGRESS', stats=stats)
+    if stats.sentences_done // HEARTBEAT_EVERY > before // HEARTBEAT_EVERY:
+        where = f' [{chapter_label}]' if chapter_label else ''
+        print(f'♥ heartbeat{where}: {stats.sentences_done} sentences, '
+              f'{stats.chars_per_sec:.0f} chars/sec (measured), ETA {stats.eta}')
+    print(f'Estimated time remaining: {stats.eta}')
+    print('Progress:', f'{stats.progress}%\n')
+
+
+def _cache_key_fields(backend, voice, speed):
+    """Versioned key components that, with the sentence text, address a synth result."""
+    info = backends.BACKENDS[backend]
+    repo_id = 'mlx-community/Kokoro-82M-bf16' if info.engine == 'mlx' else 'hexgrad/Kokoro-82M'
+    return dict(engine=info.engine, repo_id=repo_id, voice=voice, speed=speed,
+                max_sentence_length=MAX_SENTENCE_LENGTH, spacy_version=spacy.__version__)
+
+
+def _split_into_sentences(doc, lang_code):
+    if lang_code in 'ab':
+        return [s.text for s in doc.sents]
+    # For non-english languages, Kokoro truncates long sentences, so we split them manually.
+    sentences = []
+    for sent in list(doc.sents):
+        if len(sent.text) > MAX_SENTENCE_LENGTH:
+            print(f'Warning: Sentence too long ({len(sent.text)} chars), splitting into smaller sentences.')
+            sentences.extend(split_long_sentence(sent.text, MAX_SENTENCE_LENGTH))
+        else:
+            sentences.append(sent.text)
+    return sentences
+
+
 def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
                        chapter_label=None, batch_max_chars=BATCH_MAX_CHARS,
-                       synth_retries=SYNTH_RETRIES, dead_letter_path=None):
+                       synth_retries=SYNTH_RETRIES, dead_letter_path=None,
+                       cache=None, cache_key_fields=None):
     nlp = load_spacy()
     audio_segments = []
-    doc = nlp(text)
-    lang_code = voice[0]
-
-    if lang_code in 'ab':
-        sentences = [s.text for s in doc.sents]
-    else:
-        # For non-english languages, Kokoro truncates long sentences, so we split them manually
-        sentences = []
-        for sent in list(doc.sents):
-            if len(sent.text) > MAX_SENTENCE_LENGTH:
-                print(f'Warning: Sentence too long ({len(sent.text)} chars), splitting into smaller sentences.')
-                sents = split_long_sentence(sent.text, MAX_SENTENCE_LENGTH)
-                sentences.extend(sents)
-            else:
-                sentences.append(sent.text)
-
+    sentences = _split_into_sentences(nlp(text), voice[0])
     if max_sentences:
         sentences = sentences[:max_sentences]
+
+    if cache is not None:
+        # KEYSTONE slice 1: cache per sentence (the addressable unit). Misses are synthesized
+        # one sentence at a time so each stored array maps 1:1 to a sentence; batching the
+        # misses is a documented later optimization.
+        from audiblez import cache as cache_mod
+        for sent in sentences:
+            key = cache_mod.make_key(text=sent, **(cache_key_fields or {}))
+            hit = cache.get(key)
+            if hit is not None:
+                audio_segments.append(hit)
+                _account(stats, 1, len(sent), 0.0, post_event, chapter_label)
+                continue
+            t0 = time.time()
+            try:
+                segs = _retry(lambda s=sent: synth(s, speed), synth_retries)
+                audio = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+                cache.put(key, audio)
+            except Exception as e:
+                print(f'\033[91mSentence failed after {synth_retries + 1} attempts; inserting silence.\033[0m')
+                audio = _silence_for(sent)  # not cached — never persist a failure
+                if dead_letter_path:
+                    _record_dead_letter(dead_letter_path, chapter_label, sent, str(e))
+            audio_segments.append(audio)
+            _account(stats, 1, len(sent), time.time() - t0, post_event, chapter_label)
+        return audio_segments
 
     for batch in pack_sentences(sentences, batch_max_chars):
         t0 = time.time()
@@ -445,19 +512,8 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
         audio_segments.extend(_synth_batch(synth, batch, speed, retries=synth_retries,
                                            chapter_label=chapter_label,
                                            dead_letter_path=dead_letter_path))
-        elapsed = time.time() - t0
-        if stats:
-            before = getattr(stats, 'sentences_done', 0)
-            _update_eta(stats, sum(len(s) for s in batch), elapsed)
-            stats.sentences_done = before + len(batch)
-            if post_event: post_event('CORE_PROGRESS', stats=stats)
-            # Heartbeat when this batch crossed a HEARTBEAT_EVERY boundary.
-            if stats.sentences_done // HEARTBEAT_EVERY > before // HEARTBEAT_EVERY:
-                where = f' [{chapter_label}]' if chapter_label else ''
-                print(f'♥ heartbeat{where}: {stats.sentences_done} sentences, '
-                      f'{stats.chars_per_sec:.0f} chars/sec (measured), ETA {stats.eta}')
-            print(f'Estimated time remaining: {stats.eta}')
-            print('Progress:', f'{stats.progress}%\n')
+        _account(stats, len(batch), sum(len(s) for s in batch), time.time() - t0,
+                 post_event, chapter_label)
     return audio_segments
 
 

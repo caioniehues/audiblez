@@ -39,6 +39,9 @@ def cli_main():
     parser.add_argument('--seed-lexicon', dest='seed_lexicon', default=False, action='store_true',
                         help='Write a <book>.lexicon.json of candidate names/acronyms to edit, '
                              'then exit; applied as pronunciation overrides on the next run')
+    parser.add_argument('--cache', default=False, action='store_true',
+                        help='Cache synthesized sentences under <output>/.audiblez_cache and '
+                             'reuse them on re-runs/Preview (opt-in; cache only, no resume)')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -105,8 +108,11 @@ def cli_main():
         result = make_trailer(args.epub_file_path, args.voice, out, speed=args.speed, backend=backend)
         sys.exit(0 if result else 1)
 
+    import os
+    cache_dir = os.path.join(args.output, '.audiblez_cache') if args.cache else None
     from audiblez.core import main
-    main(args.epub_file_path, args.voice, args.pick, args.speed, args.output, backend=backend)
+    main(args.epub_file_path, args.voice, args.pick, args.speed, args.output, backend=backend,
+         cache_dir=cache_dir)
 
 
 if __name__ == '__main__':
