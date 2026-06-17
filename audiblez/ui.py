@@ -312,9 +312,12 @@ class MainWindow(wx.Frame):
         voice_dropdown.Bind(wx.EVT_COMBOBOX, self.on_select_voice)
         audition_button = wx.Button(panel, label="🗣️ Audition voice")
         audition_button.Bind(wx.EVT_BUTTON, self.on_audition_voice)
+        lexicon_button = wx.Button(panel, label="📖 Pronunciations")
+        lexicon_button.Bind(wx.EVT_BUTTON, self.on_edit_lexicon)
         sizer.Add(voice_label, pos=(1, 0), flag=wx.ALL, border=border)
         sizer.Add(voice_dropdown, pos=(1, 1), flag=wx.ALL, border=border)
         sizer.Add(audition_button, pos=(1, 2), flag=wx.ALL, border=border)
+        sizer.Add(lexicon_button, pos=(1, 3), flag=wx.ALL, border=border)
 
         # Speed: a spin control bounded to 0.5–2.0 (cannot accept invalid input)
         speed_label = wx.StaticText(panel, label="Speed:")
@@ -591,6 +594,40 @@ class MainWindow(wx.Frame):
             return result
 
         self._spawn_player(button, "🎬 Preview whole book (trailer)", produce)
+
+    def on_edit_lexicon(self, event):
+        """Open a small JSON editor for this book's pronunciation lexicon (term -> respelling)."""
+        import json
+        from audiblez import lexicon
+        path = lexicon.lexicon_path(self.selected_file_path, self.output_folder_text_ctrl.GetValue())
+        current = lexicon.load_lexicon(path)
+        if not current:
+            # Seed candidates from the book so the editor isn't empty on first open.
+            book_text = '\n'.join(c.extracted_text for c in getattr(self, 'document_chapters', []))
+            current = lexicon.build_seed_lexicon(book_text)
+
+        dialog = wx.Dialog(self, title='Pronunciation Lexicon', size=(520, 540))
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        info = wx.StaticText(dialog, label='Set the respelling (value) for each term, then Save.\n'
+                                           'Entries where the value equals the term are ignored.')
+        sizer.Add(info, 0, wx.ALL, 8)
+        text_ctrl = wx.TextCtrl(dialog, style=wx.TE_MULTILINE,
+                                value=json.dumps(current, ensure_ascii=False, indent=2, sort_keys=True))
+        text_ctrl.SetFont(wx.Font(11, wx.MODERN, wx.NORMAL, wx.NORMAL))
+        sizer.Add(text_ctrl, 1, wx.ALL | wx.EXPAND, 8)
+        sizer.Add(dialog.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 8)
+        dialog.SetSizer(sizer)
+
+        if dialog.ShowModal() == wx.ID_OK:
+            try:
+                mapping = json.loads(text_ctrl.GetValue())
+                if not isinstance(mapping, dict):
+                    raise ValueError('Lexicon must be a JSON object mapping "term" to "respelling".')
+                lexicon.save_lexicon(path, mapping)
+                wx.MessageBox(f'Saved {len(mapping)} term(s) to\n{path}', 'Pronunciation Lexicon')
+            except (ValueError, json.JSONDecodeError) as e:
+                wx.MessageBox(f'Could not save lexicon:\n{e}', 'Invalid JSON')
+        dialog.Destroy()
 
     def on_start(self, event):
         self.synthesis_in_progress = True

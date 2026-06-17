@@ -24,6 +24,7 @@ from ebooklib import epub
 from pick import pick
 
 from audiblez import backends
+from audiblez import lexicon
 
 sample_rate = 24000
 _nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
@@ -132,6 +133,11 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     if cover_maybe:
         print(f'Found cover image {cover_maybe.file_name} in {cover_maybe.media_type} format')
 
+    # Book-scoped pronunciation overrides (no sidecar -> empty dict -> no-op).
+    book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder))
+    if lexicon.fingerprint(book_lexicon):
+        print(f'Loaded pronunciation lexicon with {len(lexicon._active(book_lexicon))} override(s).')
+
     document_chapters = find_document_chapters_and_extract_texts(book)
 
     if not selected_chapters:
@@ -190,6 +196,8 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             # (not necessarily i == 1, which may have been skipped or empty).
             text = f'{title} – {creator}.\n\n' + text
             intro_added = True
+        # Apply pronunciation overrides before synthesis (pre-phonemization).
+        text = lexicon.apply_lexicon(text, book_lexicon)
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         # Fresh dead-letter per (re)generated chapter; failed sentences are appended here.
@@ -483,12 +491,13 @@ def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend
     chapters = selected_chapters or find_good_chapters(document_chapters)
     synth = build_synthesizer(voice, backend)
     gap = np.zeros(int(TRAILER_GAP_SECONDS * sample_rate), dtype=np.float32)
+    book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder='.'))
 
     pieces, sampled = [], 0
     for n, chapter in enumerate(chapters, start=1):
         if max_chapters and sampled >= max_chapters:
             break
-        text = chapter.extracted_text.strip()
+        text = lexicon.apply_lexicon(chapter.extracted_text.strip(), book_lexicon)
         if len(text) < 10:
             continue
         pieces.extend(gen_audio_segments(synth, f'Chapter {n}.', voice=voice, speed=speed))

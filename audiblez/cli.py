@@ -36,6 +36,9 @@ def cli_main():
     parser.add_argument('--trailer', default=False, action='store_true',
                         help='Render a short trailer.wav sampling the opening of each chapter '
                              'and exit (audition voice + chapter detection before a full run)')
+    parser.add_argument('--seed-lexicon', dest='seed_lexicon', default=False, action='store_true',
+                        help='Write a <book>.lexicon.json of candidate names/acronyms to edit, '
+                             'then exit; applied as pronunciation overrides on the next run')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -57,6 +60,21 @@ def cli_main():
         from audiblez.core import merge_chapters
         result = merge_chapters(args.epub_file_path, args.voice, args.output)
         sys.exit(0 if result else 1)
+
+    # --seed-lexicon writes editable pronunciation candidates; no backend/model needed.
+    if args.seed_lexicon:
+        from ebooklib import epub
+        from audiblez import lexicon
+        from audiblez.core import find_document_chapters_and_extract_texts
+        chapters = find_document_chapters_and_extract_texts(epub.read_epub(args.epub_file_path))
+        text = '\n'.join(c.extracted_text for c in chapters)
+        path = lexicon.lexicon_path(args.epub_file_path, args.output)
+        merged = lexicon.build_seed_lexicon(text)
+        merged.update(lexicon.load_lexicon(path))  # never clobber existing user edits
+        lexicon.save_lexicon(path, merged)
+        print(f'Wrote {len(merged)} candidate term(s) to {path}.')
+        print('Edit the JSON values to set pronunciations (respellings); they apply on the next run.')
+        sys.exit(0)
 
     avail = backends.available_backends()
     if args.backend is not None:
