@@ -83,16 +83,11 @@ MOSS_DECODER_GGUF = 'moss_tts_audio_decoder_f16.gguf'
 MOSS_ENCODER_GGUF = 'moss_tts_audio_encoder_f16.gguf'   # only for voice cloning (Phase-2)
 
 MOSS_SEED = 42                        # pinned: the cache key must be stable across runs
-# The six sampling params, pinned to fixed defaults (ADR 0005). Order is irrelevant — the
-# cache fingerprints the dict by sorted keys (see _moss_sampling_sig).
-MOSS_SAMPLING = {
-    'text_temperature': 1.5,
-    'text_top_k': 50,
-    'audio_temperature': 1.7,
-    'audio_top_p': 0.8,
-    'audio_top_k': 25,
-    'audio_repetition_penalty': 1.0,
-}
+# The six sampling params, pinned to fixed defaults (ADR 0005). SINGLE source: alias the
+# import-light backends copy so the synth request, the cache key (_moss_sampling_sig), and
+# doctor can never drift to two different dicts. Order is irrelevant — the cache fingerprints
+# the dict by sorted keys (see _moss_sampling_sig).
+MOSS_SAMPLING = backends.MOSS_SAMPLING_DEFAULTS
 SAMPLING_DEFAULTS = MOSS_SAMPLING     # canonical alias (the name T3/T4 reference)
 MOSS_MAX_NEW_TOKENS = 2048            # per-request cap sent to the child
 MOSS_SAMPLE_RATE = 24000              # the child writes 24 kHz wavs; must match `sample_rate`
@@ -110,6 +105,7 @@ MOSS_TIMEOUT_SECONDS_PER_CHAR = 0.25  # deadline scales with sentence length abo
 MOSS_RESTART_WINDOW_SECONDS = 120.0   # circuit-breaker: look at restarts in this trailing window
 MOSS_MAX_RESTARTS_IN_WINDOW = 5       # ...abort the run if more than this many fall inside it
 MOSS_SPAWN_READY_TIMEOUT = 180.0      # cold-start model load can take a while (RADV compile)
+MOSS_SHUTDOWN_WRITE_TIMEOUT = 5.0     # bound the graceful-shutdown write; a wedged child -> kill
 
 
 class MossError(Exception):
@@ -327,22 +323,23 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     # GPU GEMM autotuning must be configured before the first synth (TunableOp caches
     # its env on first read); persist the results CSV under the output folder.
     gpu.configure_tunableop(tune, backend, results_dir=output_folder)
-    # Slice-0: one SynthParams threads voice/backend/precision/clone_ref/coarse through the
-    # engine seam (so a new knob can't be wired into cli.py and missed in ui.py). The resident
-    # MOSS child (engine='llamacpp') is spawned here and MUST be torn down in the finally below,
-    # or an 8 GB-VRAM child is orphaned when synthesis raises or the run ends.
-    synth = build_synthesizer(params=SynthParams(
-        voice=voice, backend=backend, precision=precision, clone_ref=clone_ref, coarse=coarse),
-        work_dir=output_folder)
-    # Resolve the spec's language code once for the whole run and thread it into each
-    # gen_audio_segments call, instead of re-parsing the spec per chapter.
-    lang_code = voicelib.voice_lang_code(voice)
-
     chapter_wav_files = []
     intro_added = False
     total_failures = 0  # dead-lettered sentences across the whole book (degraded-run signal)
-    render_signature = _render_signature(book_lexicon, speed, precision)
+    synth = None  # bound inside the try so a raise at/after engine-build can't skip the finally
     try:
+      # Slice-0: one SynthParams threads voice/backend/precision/clone_ref/coarse through the
+      # engine seam (so a new knob can't be wired into cli.py and missed in ui.py). Spawn the
+      # resident MOSS child (engine='llamacpp') INSIDE the try so a raise here OR in the setup
+      # below (voice parse, signature) still reaches the finally — else an 8 GB-VRAM child leaks.
+      synth = build_synthesizer(params=SynthParams(
+          voice=voice, backend=backend, precision=precision, clone_ref=clone_ref, coarse=coarse),
+          work_dir=output_folder)
+      # Resolve the spec's language code once for the whole run and thread it into each
+      # gen_audio_segments call, instead of re-parsing the spec per chapter.
+      lang_code = voicelib.voice_lang_code(voice)
+      render_signature = _render_signature(book_lexicon, speed, precision,
+                                           backend=backend, clone_ref=clone_ref)
       for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
@@ -554,6 +551,11 @@ def build_synthesizer(voice=None, backend: str = 'cpu', precision: str = 'fp32',
         params = SynthParams(voice=voice, backend=backend, precision=precision, clone_ref=clone_ref)
     voice, backend, precision, clone_ref = (
         params.voice, params.backend, params.precision, params.clone_ref)
+    if getattr(params, 'coarse', False):
+        # The coarse-chunk synth path (chunking.pack_chunks) is not wired yet — accept the flag
+        # but don't silently imply the speedup happened. Warn rather than pretend (no-op promise).
+        print('\033[93mWarning: --coarse is accepted but not yet wired; synthesizing at normal '
+              'sentence granularity (no speed gain yet).\033[0m')
     if backend not in backends.BACKENDS:
         raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
     info = backends.BACKENDS[backend]
@@ -679,17 +681,23 @@ class MossProcess:
         a missing/broken MOSS must NOT silently fall back to Kokoro)."""
         self.work_dir.mkdir(parents=True, exist_ok=True)
         try:
-            self.proc = self._popen_factory(
-                self._command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, bufsize=0)
-        except (OSError, FileNotFoundError) as e:
-            raise MossSpawnError(
-                f"Could not spawn the MOSS engine ({self.binary!r}): {e}. "
-                f"Install/patch the OpenMOSS llama.cpp fork, or run with '-b cpu' to use "
-                f"Kokoro instead.") from e
-        self.spawns += 1
-        self._start_stderr_drain()
-        self._wait_ready()
+            try:
+                self.proc = self._popen_factory(
+                    self._command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, bufsize=0)
+            except (OSError, FileNotFoundError) as e:
+                raise MossSpawnError(
+                    f"Could not spawn the MOSS engine ({self.binary!r}): {e}. "
+                    f"Install/patch the OpenMOSS llama.cpp fork, or run with '-b cpu' to use "
+                    f"Kokoro instead.") from e
+            self.spawns += 1
+            self._start_stderr_drain()
+            self._wait_ready()
+        except BaseException:
+            # Spawn or ready-handshake failed: close() will never run (no synth was built), so
+            # remove the handoff dir we just created rather than leak an empty .moss_handoff_*.
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+            raise
         return self
 
     def _start_stderr_drain(self):
@@ -761,6 +769,38 @@ class MossProcess:
             return None  # EOF
         return raw.decode('utf-8', 'replace').rstrip('\n') if isinstance(raw, bytes) else str(raw).rstrip('\n')
 
+    def _write(self, data, timeout):
+        """Write+flush ``data`` to the child's stdin under a deadline. Returns True on success,
+        False if it didn't complete within ``timeout`` (or the pipe broke).
+
+        ``bufsize=0`` means a write to a FULL stdin pipe blocks at the OS level with no timeout,
+        so a wedged-but-alive child (the exact failure the death-timeout design exists to survive)
+        would hang the synth hot path / teardown forever. Doing the write on a daemon thread turns
+        a stuck write into a recoverable signal (caller treats False as a death -> restart/kill)
+        instead of a hard hang. Mirrors :meth:`_read_line`'s watchdog pattern for the read side.
+        """
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            return False
+        stdin = proc.stdin
+        result = {}
+        done = threading.Event()
+
+        def wr():
+            try:
+                stdin.write(data)
+                stdin.flush()
+                result['ok'] = True
+            except (BrokenPipeError, ValueError, OSError):
+                result['ok'] = False
+            finally:
+                done.set()
+
+        threading.Thread(target=wr, daemon=True).start()
+        if not done.wait(timeout=timeout):
+            return False  # write wedged: child alive but not draining its stdin
+        return result.get('ok', False)
+
     @staticmethod
     def _parse_json(line):
         try:
@@ -795,11 +835,12 @@ class MossProcess:
             'wav_out': str(wav_out), 'seed': MOSS_SEED,
             'sampling': dict(MOSS_SAMPLING), 'max_new_tokens': MOSS_MAX_NEW_TOKENS,
         }
-        try:
-            self.proc.stdin.write((json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8'))
-            self.proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            raise MossDeath(f'broken pipe writing request {req_id}') from e
+        payload = (json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8')
+        # Bound the write: a wedged-but-alive child with a full stdin pipe would otherwise block
+        # this write forever (before the deadline read-loop is ever reached). A non-completing
+        # write is a death -> the closure restarts the child and re-dispatches the sentence.
+        if not self._write(payload, timeout=timeout):
+            raise MossDeath(f'request {req_id} write did not complete (wedged child or broken pipe)')
 
         deadline = time.time() + timeout
         while True:
@@ -848,14 +889,16 @@ class MossProcess:
         proc = self.proc
         try:
             if proc is not None and proc.poll() is None and proc.stdin is not None:
-                try:
-                    proc.stdin.write(b'{"op":"shutdown"}\n')
-                    proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-                try:
-                    proc.wait(timeout=10)
-                except Exception:
+                # Bound the graceful-shutdown write too: a wedged-but-alive child would hang
+                # core.main's finally forever (reachable on the breaker path, where the child
+                # is still alive at teardown). If the write doesn't complete, kill rather than
+                # wait on a graceful exit the child can't perform.
+                if self._write(b'{"op":"shutdown"}\n', timeout=MOSS_SHUTDOWN_WRITE_TIMEOUT):
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:
+                        self._kill()
+                else:
                     self._kill()
         finally:
             self.proc = None
@@ -1291,14 +1334,15 @@ def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend
         chapters = selected_chapters
     else:
         chapters = find_good_chapters(find_document_chapters_and_extract_texts(epub.read_epub(file_path)))
-    synth = build_synthesizer(voice, backend, precision=precision)
     gap = np.zeros(int(TRAILER_GAP_SECONDS * sample_rate), dtype=np.float32)
-    # Same scope as seeding and the real run, so the trailer auditions the SAME pronunciations.
-    book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder))
     preview_chars = MAX_SENTENCE_LENGTH * (sentences_per_chapter + 1)
 
     pieces, sampled = [], 0
+    synth = None  # built inside the try so load_lexicon raising can't orphan the MOSS child
     try:
+        synth = build_synthesizer(voice, backend, precision=precision)
+        # Same scope as seeding and the real run, so the trailer auditions the SAME pronunciations.
+        book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder))
         for chapter in chapters:
             if max_chapters and sampled >= max_chapters:
                 break
@@ -1441,16 +1485,30 @@ def probe_duration(file_name):
         return None
 
 
-def _render_signature(book_lexicon, speed, precision):
+def _render_signature(book_lexicon, speed, precision, backend=None, clone_ref=None):
     """Compact fingerprint of render-affecting inputs NOT already in the chapter filename.
 
     The wav filename encodes book stem, chapter index, and voice; this captures the rest
     (active lexicon, speed, precision). Stored next to each chapter wav as a ``.sig`` so
     that editing the lexicon (or changing speed/precision) invalidates the existing wav on
     the resume-by-skip path instead of silently reusing audio from the old settings.
+
+    For the MOSS engine ('llamacpp') the chapter filename encodes only book/index/voice and
+    speed is applied post-hoc via atempo, so the GGUF identity, pinned seed, sampling params,
+    and any voice-clone reference are otherwise UNcaptured. Fold them in (the same axes as
+    ``_cache_key_fields``) — else the resume-by-skip gate reuses a stale chapter wav after a
+    model/sampling/clone swap, which also masks the clone-ref filename collision (two clone
+    refs share a wav name): both are the banned silent-wrongness class. Kokoro backends emit
+    the exact pre-MOSS string (no suffix), so existing ``.sig`` files stay valid.
     """
-    return (f'lex={lexicon.fingerprint(book_lexicon)}'
-            f';speed={round(float(speed), 4)};precision={precision}')
+    sig = (f'lex={lexicon.fingerprint(book_lexicon)}'
+           f';speed={round(float(speed), 4)};precision={precision}')
+    info = backends.BACKENDS.get(backend) if backend is not None else None
+    if info is not None and info.engine == 'llamacpp':
+        clone = f';clone={backends.clone_voice_id(clone_ref)}' if clone_ref else ''
+        sig += (f';engine=llamacpp;repo={backends.moss_repo_id()}'
+                f';seed={MOSS_SEED};sampling={_moss_sampling_sig()}{clone}')
+    return sig
 
 
 def _chapter_is_complete(wav_path, render_signature):
