@@ -189,6 +189,15 @@ def cli_main():
         if backend == 'cpu':
             print('CUDA GPU not available. Defaulting to CPU')
     else:
+        # A PARTIAL MOSS install (binary present but a GGUF missing) means MOSS was clearly
+        # intended; auto-select silently uses Kokoro instead (the user's disliked engine), so
+        # warn LOUDLY and name what's missing (ADR 0005 / PRD stories 3-vs-17). Forced -b moss
+        # while incomplete aborts in main()'s preflight; this is only the auto-select path.
+        if getattr(backends, 'moss_status', lambda: 'absent')() == 'partial':
+            missing = ', '.join(k for k, v in backends.moss_paths().items() if v is None) or 'some pieces'
+            print(f'\033[93mWarning: MOSS appears installed but is incomplete (missing: {missing}); '
+                  f'auto-selecting Kokoro instead. Fix the install or pass -b moss to see the '
+                  f'exact preflight error.\033[0m')
         # Auto-select the best available backend (GPU when present), falling back to CPU.
         # Probe the GPU with a real kernel: torch.cuda.is_available() can be True while the
         # device faults on first use (e.g. RDNA3 without HSA_OVERRIDE_GFX_VERSION), which

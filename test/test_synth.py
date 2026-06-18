@@ -514,14 +514,15 @@ class MossAbortNotSwallowedTest(unittest.TestCase):
 
 @unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
 class MossCacheFieldsTest(unittest.TestCase):
-    def test_cache_fields_for_moss_include_seed_sampling_and_3gguf_repo(self):
+    def test_cache_fields_for_moss_include_seed_sampling_and_repo(self):
         info = backends.BackendInfo('moss', 'MOSS', 'llamacpp', None)
         with mock.patch.dict(core.backends.BACKENDS, {'moss': info}):
             fields = core._cache_key_fields('moss', 'af_voice', 1.5, precision='fp16')
         self.assertEqual(fields['engine'], 'llamacpp')
         self.assertEqual(fields['seed'], core.MOSS_SEED)
         self.assertIn('sampling_sig', fields)
-        self.assertTrue(fields['repo_id'].startswith('moss:'))
+        # repo_id comes from the SINGLE source of truth (backends.moss_repo_id() -> 'moss-gguf:').
+        self.assertTrue(fields['repo_id'].startswith('moss-gguf:'))
         # MOSS cache is speed-agnostic (speed handled by atempo at assembly) -> pinned to 1.0.
         self.assertEqual(fields['speed'], 1.0)
         # precision is irrelevant to MOSS -> normalised, never the fp16 the caller passed.
@@ -533,11 +534,20 @@ class MossCacheFieldsTest(unittest.TestCase):
         drifted['audio_top_k'] = 99
         self.assertNotEqual(base, core._moss_sampling_sig(drifted))
 
-    def test_repo_id_changes_with_clone_ref(self):
-        text_only = core._moss_repo_id(clone_ref=None)
-        with tempfile.NamedTemporaryFile(suffix='.wav') as ref:
-            cloned = core._moss_repo_id(clone_ref=ref.name)
-        self.assertNotEqual(text_only, cloned)  # the clone ref changes the waveform -> the key
+    def test_clone_ref_changes_the_cache_key_via_voice_axis(self):
+        # The clone reference IS the voice (backends.clone_voice_id); two different refs must
+        # produce different cache fields, else a re-run serves the prior clone's audio.
+        info = backends.BackendInfo('moss', 'MOSS', 'llamacpp', None)
+        with mock.patch.dict(core.backends.BACKENDS, {'moss': info}):
+            with tempfile.NamedTemporaryFile(suffix='.wav') as a, \
+                 tempfile.NamedTemporaryFile(suffix='.wav') as b:
+                a.write(b'AAAA'); a.flush()
+                b.write(b'BBBB'); b.flush()
+                fa = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=a.name)
+                fb = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=b.name)
+                ftext = core._cache_key_fields('moss', 'af_voice', 1.0)
+        self.assertNotEqual(fa['voice'], fb['voice'])   # different clip -> different voice id
+        self.assertEqual(ftext['voice'], 'af_voice')    # text-only keeps the plain voice spec
 
 
 @unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
