@@ -346,6 +346,26 @@ class MossProcessTransportTest(unittest.TestCase):
         self.assertEqual(set(captured['req']['sampling']), set(core.MOSS_SAMPLING))
         proc.close()
 
+    def test_command_has_t1_serve_invocation_flags(self):
+        # T1's --serve binary (moss-serve-json-v1) requires these exact flags at spawn;
+        # the fixed frame caps size the resident contexts. Regression-guard the invocation.
+        proc = core.MossProcess(backbone='bb.gguf', decoder='dec.gguf', binary='llama-moss-tts',
+                                work_dir=tempfile.mkdtemp())
+        cmd = proc._command()
+        self.assertEqual(cmd[:2], ['llama-moss-tts', '--serve'])
+        for flag in ('--language', 'en', '-ngl', '-1', '--max-prompt-frames', '512',
+                     '--max-raw-frames', '768', '--audio-decoder-model'):
+            self.assertIn(flag, cmd)
+        self.assertNotIn('--reference-audio', cmd)  # no clone ref -> no encoder/reference flags
+
+    def test_command_adds_clone_flags_when_cloning(self):
+        proc = core.MossProcess(backbone='bb', decoder='dec', encoder='enc.gguf',
+                                clone_ref='/ref.wav', work_dir=tempfile.mkdtemp())
+        cmd = proc._command()
+        self.assertIn('--audio-encoder-model', cmd)
+        self.assertIn('--reference-audio', cmd)
+        self.assertIn('/ref.wav', cmd)
+
     def test_error_status_raises_mosserror(self):
         proc = self._proc(script=lambda req, wav: [{'v': 1, 'id': req['id'], 'status': 'error',
                                                     'code': 'gen_failed', 'message': 'boom'}])
