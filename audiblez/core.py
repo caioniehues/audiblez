@@ -179,9 +179,18 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             selected_chapters = find_good_chapters(document_chapters)
     elif all(isinstance(c, int) for c in selected_chapters):
         # Headless --chapters passes 1-based indices into document_chapters (the GUI passes
-        # chapter objects). Resolve indices to objects; silently drop out-of-range entries.
-        selected_chapters = [document_chapters[i - 1] for i in selected_chapters
-                             if 1 <= i <= len(document_chapters)]
+        # chapter objects). Resolve indices to objects; an out-of-range index is a degraded
+        # run, so surface it (don't silently narrate fewer chapters than the user asked for).
+        n = len(document_chapters)
+        requested = selected_chapters
+        out_of_range = [i for i in requested if not (1 <= i <= n)]
+        if out_of_range:
+            print(f'\033[93mWarning: ignoring out-of-range chapter index/indices '
+                  f'{out_of_range} (book has {n} chapters).\033[0m')
+        selected_chapters = [document_chapters[i - 1] for i in requested if 1 <= i <= n]
+        if not selected_chapters:
+            raise ValueError(f'No valid chapters selected from --chapters {requested}; '
+                             f'book has {n} chapters (use 1-based indices).')
     print_selected_chapters(document_chapters, selected_chapters)
 
     if chapter_text_dir is not None:

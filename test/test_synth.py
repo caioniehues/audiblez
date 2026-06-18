@@ -85,19 +85,24 @@ class BuildSynthesizerTest(unittest.TestCase):
 
 
 def _drive_main(d, chapters, voice='af_heart', shutil_which=None, post_event=None,
-                gen_segments=None):
+                gen_segments=None, document_chapters=None, selected_chapters=None):
     """Run core.main() over `chapters` with all heavy I/O mocked (no epub/spaCy/ffmpeg/disk).
 
     `shutil_which` is the return of shutil.which (None => ffmpeg absent). `gen_segments`, if given,
     is used as gen_audio_segments' side_effect/return so callers can inspect the text it receives.
+    `document_chapters` (defaults to `chapters`) is what find_document_chapters_and_extract_texts
+    returns — pass a SUPERSET when exercising the headless --chapters index path so the resolved
+    selection is observably a subset. `selected_chapters` is forwarded to main() verbatim.
     """
     if gen_segments is None:
         gen_segments = mock.Mock(return_value=[np.zeros(4, dtype=np.float32)])
+    if document_chapters is None:
+        document_chapters = chapters
     with mock.patch.object(core, 'load_spacy'), \
          mock.patch.object(core, 'epub') as ep, \
          mock.patch.object(core, 'extract_book_metadata', return_value=('Title', 'Author')), \
          mock.patch.object(core, 'find_cover', return_value=None), \
-         mock.patch.object(core, 'find_document_chapters_and_extract_texts', return_value=chapters), \
+         mock.patch.object(core, 'find_document_chapters_and_extract_texts', return_value=document_chapters), \
          mock.patch.object(core, 'find_good_chapters', return_value=chapters), \
          mock.patch.object(core, 'set_espeak_library'), \
          mock.patch.object(core, 'build_synthesizer', return_value=lambda *a, **k: []), \
@@ -107,7 +112,8 @@ def _drive_main(d, chapters, voice='af_heart', shutil_which=None, post_event=Non
         ep.read_epub.return_value = object()
         sh.which.return_value = shutil_which
         sf.write.return_value = None
-        core.main('book.epub', voice, False, 1.0, output_folder=d, post_event=post_event)
+        core.main('book.epub', voice, False, 1.0, output_folder=d, post_event=post_event,
+                  selected_chapters=selected_chapters)
     return gen_segments
 
 
@@ -154,6 +160,45 @@ class IntroOnResumeTest(unittest.TestCase):
         synthesized = seen[0]
         self.assertNotIn('Title – Author', synthesized)  # intro was consumed by the skipped chapter 1
         self.assertTrue(synthesized.startswith('Chapter two body'))
+
+
+@unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
+class HeadlessChapterIndexTest(unittest.TestCase):
+    """Headless --chapters passes 1-based indices into document_chapters; main() must resolve
+    them to the right chapter objects (the GUI passes objects instead, which bypass this)."""
+
+    def _run(self, selected, n_doc=3):
+        docs = [_chapter(f'Body of chapter {k}, definitely longer than ten characters.',
+                         index=k - 1, name=f'Text/Chap{k:02d}.xhtml') for k in range(1, n_doc + 1)]
+        seen = []
+        gen = mock.Mock(side_effect=lambda synth, text, *a, **k: (seen.append(text),
+                                                                  [np.zeros(4, dtype=np.float32)])[1])
+        with tempfile.TemporaryDirectory() as d:
+            _drive_main(d, docs, gen_segments=gen, document_chapters=docs, selected_chapters=selected)
+        return seen
+
+    def test_indices_resolve_to_matching_chapters(self):
+        seen = self._run([1, 3])
+        self.assertEqual(len(seen), 2)
+        # Order preserved; chapter 1 carries the prepended intro, chapter 3 does not.
+        self.assertIn('Body of chapter 1', seen[0])
+        self.assertIn('Body of chapter 3', seen[1])
+        self.assertNotIn('Body of chapter 2', ' '.join(seen))
+
+    def test_out_of_range_index_is_warned_and_dropped(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            seen = self._run([1, 99])
+        self.assertEqual(len(seen), 1)
+        self.assertIn('Body of chapter 1', seen[0])
+        self.assertIn('out-of-range', buf.getvalue())
+        self.assertIn('99', buf.getvalue())
+
+    def test_all_indices_out_of_range_raises(self):
+        with self.assertRaises(ValueError):
+            self._run([99])
 
 
 if __name__ == '__main__':
