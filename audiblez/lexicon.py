@@ -46,6 +46,7 @@ def load_lexicon(path):
 
 def save_lexicon(path, mapping):
     """Write a lexicon mapping to ``path`` as pretty, sorted JSON. Returns the path."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(mapping, f, ensure_ascii=False, indent=2, sort_keys=True)
     return path

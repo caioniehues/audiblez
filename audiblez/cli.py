@@ -58,6 +58,12 @@ def cli_main():
     if not args.epub_file_path:
         parser.error('the following arguments are required: epub_file_path (or use --doctor)')
 
+    # Ensure the output folder exists before any subcommand writes into it (--merge,
+    # --seed-lexicon, --trailer all run before main(), which is what otherwise creates it).
+    if args.output != '.':
+        import os
+        os.makedirs(args.output, exist_ok=True)
+
     # --merge needs no backend/model: just stitch existing chapter wavs into an m4b.
     if args.merge:
         from audiblez.core import merge_chapters
@@ -91,7 +97,10 @@ def cli_main():
         if backend == 'cpu':
             print('CUDA GPU not available. Defaulting to CPU')
     else:
-        backend = 'cpu'  # bare invocation stays on CPU (unchanged default behavior)
+        # Auto-select the best available backend (GPU when present), falling back to CPU.
+        backend = backends.default_backend()
+        if backend != 'cpu':
+            print(f'Auto-selected {backend} backend (pass -b cpu to force CPU)')
 
     if backend not in avail:
         print(f'Backend {backend!r} not available on this machine (have: {", ".join(avail)}). '

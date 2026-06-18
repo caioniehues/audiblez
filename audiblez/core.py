@@ -754,7 +754,10 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, title='', cr
     try:
         with open(wav_list_txt, 'w') as f:
             for wav_file in chapter_files:
-                f.write(f"file '{_escape_concat_path(wav_file)}'\n")
+                # Absolute paths: ffmpeg's concat demuxer resolves relative entries
+                # against the LIST FILE's directory, which would double a relative
+                # output-folder prefix (e.g. out/out/chapter.wav) and fail to open.
+                f.write(f"file '{_escape_concat_path(Path(wav_file).resolve())}'\n")
 
         chapters_txt_path = create_index_file(title, creator, chapter_files, output_folder)
 
