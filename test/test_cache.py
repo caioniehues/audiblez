@@ -53,6 +53,64 @@ class MakeKeyTest(unittest.TestCase):
         self.assertNotEqual(base, cache.make_key(text='hello', precision='fp16', **_FIELDS))
         self.assertEqual(base, cache.make_key(text='hello', precision='fp32', **_FIELDS))
 
+    def test_kokoro_key_is_byte_stable(self):
+        # GOLDEN REGRESSION GUARD: the existing Kokoro call path must hash byte-identically
+        # across the seed/sampling_sig additions, or every cached .npy on disk goes cold.
+        # Captured on main BEFORE the MOSS changes; assumes CACHE_VERSION == 1. The relative
+        # !=/= tests above can't catch an accidental payload change — this literal can.
+        if cache.CACHE_VERSION != 1:
+            self.skipTest('golden hash pinned at CACHE_VERSION 1')
+        self.assertEqual(
+            cache.make_key(text='hello', **_FIELDS),
+            '8cc3269e8a76befbb3ce262ee367000a362c05c596bbb54cfb20a9d42844e7d8')
+        self.assertEqual(
+            cache.make_key(text='hello', precision='bf16', **_FIELDS),
+            'e969ebcab0fa4978d9a5fedcebaf58ec4d9c493cd64a0f38964336061e167a39')
+
+
+_MOSS_FIELDS = dict(engine='llamacpp', repo_id='moss-gguf:deadbeef', voice='af_sky',
+                    speed=1.0, seed=12345, sampling_sig='t1.5_k50_at1.7_ap0.8_ak25_rp1.0')
+
+
+class MossKeyTest(unittest.TestCase):
+    """MOSS adds seed + sampling_sig + a GGUF-hashing repo_id; engine separates it from Kokoro."""
+
+    def test_moss_engine_never_collides_with_kokoro(self):
+        # Same text/voice/speed but engine differs -> distinct keys, no CACHE_VERSION bump needed.
+        kok = cache.make_key(text='hello', engine='torch', repo_id='hexgrad/Kokoro-82M',
+                             voice='af_sky', speed=1.0, max_sentence_length=400)
+        moss = cache.make_key(text='hello', **_MOSS_FIELDS)
+        self.assertNotEqual(kok, moss)
+
+    def test_seed_changes_key(self):
+        base = cache.make_key(text='hi', **_MOSS_FIELDS)
+        self.assertNotEqual(base, cache.make_key(text='hi', **{**_MOSS_FIELDS, 'seed': 999}))
+
+    def test_sampling_sig_changes_key(self):
+        base = cache.make_key(text='hi', **_MOSS_FIELDS)
+        self.assertNotEqual(base, cache.make_key(text='hi', **{**_MOSS_FIELDS, 'sampling_sig': 'other'}))
+
+    def test_repo_id_changes_key(self):
+        # repo_id hashes all three GGUF identities -> a swapped GGUF changes the key.
+        base = cache.make_key(text='hi', **_MOSS_FIELDS)
+        self.assertNotEqual(base, cache.make_key(text='hi', **{**_MOSS_FIELDS, 'repo_id': 'moss-gguf:0000'}))
+
+    def test_seed_and_sampling_are_omitted_when_none(self):
+        # When seed/sampling_sig are None (the Kokoro path), they must not appear in the payload,
+        # so a torch key with no MOSS knobs equals the same call with explicit None.
+        a = cache.make_key(text='hi', engine='torch', repo_id='r', voice='v', speed=1.0,
+                           max_sentence_length=400)
+        b = cache.make_key(text='hi', engine='torch', repo_id='r', voice='v', speed=1.0,
+                           max_sentence_length=400, seed=None, sampling_sig=None)
+        self.assertEqual(a, b)
+
+    def test_msl_omitted_for_moss_does_not_equal_msl_present(self):
+        # MOSS omits max_sentence_length (it doesn't split on MSL); that omission is itself part
+        # of the key, so adding an msl yields a different hash (no accidental cross-contamination).
+        no_msl = cache.make_key(text='hi', **_MOSS_FIELDS)
+        with_msl = cache.make_key(text='hi', **{**_MOSS_FIELDS, 'max_sentence_length': 400})
+        self.assertNotEqual(no_msl, with_msl)
+
 
 class SynthCacheTest(unittest.TestCase):
     def test_miss_then_put_then_hit(self):

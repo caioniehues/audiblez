@@ -20,7 +20,12 @@ def _fake_torch(cuda=False, hip=None, cuda_ver=None, mps=False):
 
 class BackendTableTest(unittest.TestCase):
     def test_ids_and_order(self):
-        self.assertEqual(backends.BACKEND_IDS, ('cpu', 'cuda', 'rocm', 'mps', 'mlx'))
+        self.assertEqual(backends.BACKEND_IDS, ('cpu', 'cuda', 'rocm', 'mps', 'mlx', 'moss'))
+
+    def test_moss_is_llamacpp_engine_no_torch_device(self):
+        info = backends.BACKENDS['moss']
+        self.assertEqual(info.engine, 'llamacpp')
+        self.assertIsNone(info.torch_device)
 
     def test_device_mapping(self):
         # cuda and rocm both ride the torch.cuda API -> same torch device
@@ -33,15 +38,17 @@ class BackendTableTest(unittest.TestCase):
         self.assertIsNone(backends.BACKENDS['mlx'].torch_device)
 
     def test_is_gpu(self):
-        for gpu in ('cuda', 'rocm', 'mps', 'mlx'):
+        for gpu in ('cuda', 'rocm', 'mps', 'mlx', 'moss'):  # moss = Vulkan-on-GPU -> GPU ETA rate
             self.assertTrue(backends.is_gpu(gpu))
         self.assertFalse(backends.is_gpu('cpu'))
 
 
 class DetectionTest(unittest.TestCase):
-    def _avail(self, torch_obj, mlx=False):
+    def _avail(self, torch_obj, mlx=False, moss='absent'):
+        # moss_status is patched too so these stay hermetic regardless of the host's MOSS install.
         with mock.patch.dict('sys.modules', {'torch': torch_obj}), \
-             mock.patch.object(backends, '_mlx_importable', return_value=mlx):
+             mock.patch.object(backends, '_mlx_importable', return_value=mlx), \
+             mock.patch.object(backends, 'moss_status', return_value=moss):
             return backends.available_backends()
 
     def test_cpu_only(self):
@@ -68,10 +75,19 @@ class DetectionTest(unittest.TestCase):
             ('cpu', 'cuda'): 'cuda',
             ('cpu', 'rocm'): 'rocm',
             ('cpu', 'mps', 'mlx'): 'mlx',   # native MLX preferred over torch MPS (README: fastest on Mac)
+            ('cpu', 'rocm', 'moss'): 'moss',  # MOSS is the quality default (ADR 0003) -> preferred over rocm
+            ('cpu', 'cuda', 'moss'): 'moss',
         }
         for avail, expected in cases.items():
             with mock.patch.object(backends, 'available_backends', return_value=list(avail)):
                 self.assertEqual(backends.default_backend(), expected)
+
+    def test_moss_listed_only_when_present(self):
+        # A fully-installed MOSS appears in availability; a partial/absent one does not, so the
+        # auto-selector never half-picks a mis-installed MOSS.
+        self.assertIn('moss', self._avail(_fake_torch(cuda=True, hip='6.2'), moss='present'))
+        self.assertNotIn('moss', self._avail(_fake_torch(cuda=True, hip='6.2'), moss='partial'))
+        self.assertNotIn('moss', self._avail(_fake_torch(cuda=True, hip='6.2'), moss='absent'))
 
 
 class GpuWorksTest(unittest.TestCase):
@@ -91,6 +107,72 @@ class GpuWorksTest(unittest.TestCase):
         ok.ones.side_effect = lambda *a, **k: np.ones((8, 8))  # real array supports @/.sum().item()
         with mock.patch.dict('sys.modules', {'torch': ok}):
             self.assertTrue(backends.gpu_works('rocm'))
+
+
+class MossDiscoveryTest(unittest.TestCase):
+    """moss_paths/moss_repo_id/moss_status — pure path resolution, no spawn, hermetic."""
+
+    def test_paths_from_env_when_files_exist(self):
+        import os
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d:
+            binp = os.path.join(d, 'llama-moss-tts'); open(binp, 'w').close()
+            bb = os.path.join(d, 'bb_Q5_K_M.gguf'); open(bb, 'w').close()
+            dec = os.path.join(d, 'dec_f16.gguf'); open(dec, 'w').close()
+            with mock.patch.dict('os.environ', {
+                    'AUDIBLEZ_MOSS_BIN': binp, 'AUDIBLEZ_MOSS_BACKBONE': bb,
+                    'AUDIBLEZ_MOSS_DECODER': dec, 'AUDIBLEZ_MOSS_ENCODER': '/no/such/enc.gguf'}):
+                p = backends.moss_paths()
+                self.assertEqual(str(p['binary']), binp)
+                self.assertEqual(str(p['backbone']), bb)
+                self.assertEqual(str(p['decoder']), dec)
+                self.assertIsNone(p['encoder'])           # set but missing -> None
+                self.assertEqual(backends.moss_status(), 'present')  # encoder not required
+
+    def test_status_absent_when_nothing_found(self):
+        # Force every resolved path to None: no binary on PATH, env points nowhere, defaults absent.
+        with mock.patch.object(backends.shutil, 'which', return_value=None), \
+             mock.patch.dict('os.environ', {
+                 'AUDIBLEZ_MOSS_BIN': '/no/bin', 'AUDIBLEZ_MOSS_BACKBONE': '/no/bb',
+                 'AUDIBLEZ_MOSS_DECODER': '/no/dec', 'AUDIBLEZ_MOSS_ENCODER': '/no/enc'}):
+            self.assertEqual(backends.moss_status(), 'absent')
+
+    def test_status_partial_when_binary_present_gguf_missing(self):
+        import os
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d:
+            binp = os.path.join(d, 'llama-moss-tts'); open(binp, 'w').close()
+            with mock.patch.dict('os.environ', {
+                    'AUDIBLEZ_MOSS_BIN': binp, 'AUDIBLEZ_MOSS_BACKBONE': '/no/bb',
+                    'AUDIBLEZ_MOSS_DECODER': '/no/dec', 'AUDIBLEZ_MOSS_ENCODER': '/no/enc'}):
+                self.assertEqual(backends.moss_status(), 'partial')
+
+    def test_repo_id_changes_with_gguf_identity(self):
+        import os
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d:
+            bb = os.path.join(d, 'bb_Q5_K_M.gguf')
+            with open(bb, 'w') as f:
+                f.write('x')
+            dec = os.path.join(d, 'dec_f16.gguf'); open(dec, 'w').close()
+            env = {'AUDIBLEZ_MOSS_BACKBONE': bb, 'AUDIBLEZ_MOSS_DECODER': dec,
+                   'AUDIBLEZ_MOSS_ENCODER': '/no/enc'}
+            with mock.patch.dict('os.environ', env):
+                rid1 = backends.moss_repo_id()
+            # same names, different backbone SIZE -> different identity -> different repo_id
+            with open(bb, 'w') as f:
+                f.write('xxxxxxxx')
+            with mock.patch.dict('os.environ', env):
+                rid2 = backends.moss_repo_id()
+            self.assertTrue(rid1.startswith('moss-gguf:'))
+            self.assertNotEqual(rid1, rid2)
+
+    def test_repo_id_stable_for_same_identities(self):
+        with mock.patch.object(backends, 'moss_paths',
+                               return_value={'binary': None, 'backbone': None,
+                                             'decoder': None, 'encoder': None}):
+            # all-absent still yields a deterministic id (basename:absent triples)
+            self.assertEqual(backends.moss_repo_id(), backends.moss_repo_id())
 
 
 if __name__ == '__main__':

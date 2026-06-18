@@ -70,6 +70,62 @@ class ChecksTest(unittest.TestCase):
             self.assertEqual(doctor.check_backend('cpu').status, 'ok')
 
 
+def _moss_paths(binary='/bin/llama-moss-tts', backbone='/g/bb.gguf',
+                decoder='/g/dec.gguf', encoder='/g/enc.gguf'):
+    from pathlib import Path
+    return {k: (Path(v) if v else None)
+            for k, v in (('binary', binary), ('backbone', backbone),
+                         ('decoder', decoder), ('encoder', encoder))}
+
+
+class MossCheckTest(unittest.TestCase):
+    """check_moss always runs (PRD story 18); check_backend('moss') fails hard on -b moss."""
+
+    def test_moss_all_present_ok(self):
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths()):
+            r = doctor.check_moss()
+        self.assertEqual(r.status, 'ok')
+
+    def test_moss_encoder_absent_is_ok_with_clone_note(self):
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths(encoder=None)):
+            r = doctor.check_moss()
+        self.assertEqual(r.status, 'ok')       # encoder is clone-only -> still ok
+        self.assertIn('cloning', r.detail.lower())
+
+    def test_moss_missing_binary_warns_and_names_it(self):
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths(binary=None)):
+            r = doctor.check_moss()
+        self.assertEqual(r.status, 'warn')     # MOSS optional -> warn, Kokoro fallback
+        self.assertIn('binary', r.detail.lower())
+
+    def test_moss_missing_required_gguf_warns_and_names_it(self):
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths(backbone=None)):
+            r = doctor.check_moss()
+        self.assertEqual(r.status, 'warn')
+        self.assertIn('backbone', r.detail.lower())
+
+    def test_check_moss_runs_in_run_checks_unconditionally(self):
+        # Story 18: --doctor surfaces MOSS even when the selected backend is cpu.
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths(backbone=None)):
+            names = [r.name for r in doctor.run_checks('cpu')]
+        self.assertIn('MOSS (llamacpp)', names)
+
+    def test_forced_moss_backend_missing_gguf_fails(self):
+        # -b moss is explicit intent -> a missing piece is a FAIL, not a warn.
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths(decoder=None)):
+            r = doctor.check_backend('moss')
+        self.assertEqual(r.status, 'fail')
+        self.assertIn('decoder', r.detail.lower())
+
+    def test_forced_moss_backend_all_present_ok(self):
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths()):
+            self.assertEqual(doctor.check_backend('moss').status, 'ok')
+
+    def test_forced_moss_backend_encoder_absent_warns(self):
+        with mock.patch.object(doctor.backends, 'moss_paths', return_value=_moss_paths(encoder=None)):
+            self.assertEqual(doctor.check_backend('moss').status, 'warn')
+
+
 class ReportTest(unittest.TestCase):
     def test_format_report_plain_has_no_ansi(self):
         results = [doctor.CheckResult('x', 'ok', 'fine'), doctor.CheckResult('y', 'fail', 'bad')]

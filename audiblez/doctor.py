@@ -114,6 +114,36 @@ def check_spacy_model(model: str = SPACY_MODEL) -> CheckResult:
     return CheckResult(f'spaCy model {model}', 'ok', 'installed')
 
 
+def check_moss() -> CheckResult:
+    """Report MOSS (llamacpp engine) availability — binary + the three GGUF weights.
+
+    Always runs in :func:`run_checks` (not only under ``-b moss``) so a user preflighting a
+    long run sees *which* piece is missing even when MOSS won't auto-select (PRD story 18).
+    Import-light: resolves paths via :func:`audiblez.backends.moss_paths` and only stats
+    files — never spawns the binary or loads a model (that is ``--doctor --deep``).
+
+    - binary (:data:`audiblez.backends._MOSS_BIN_NAME`, NOT ``llama-cli``) + every required
+      GGUF present → ``ok``.
+    - encoder absent is a ``warn`` (needed only for voice cloning), not a fail.
+    - anything required missing → ``warn`` (MOSS is optional; Kokoro is the fallback), with
+      the exact missing pieces named.
+    """
+    paths = backends.moss_paths()
+    missing = []
+    if paths['binary'] is None:
+        missing.append(f"binary '{backends._MOSS_BIN_NAME}' not on PATH (set AUDIBLEZ_MOSS_BIN)")
+    for kind in backends.MOSS_REQUIRED:
+        if paths[kind] is None:
+            missing.append(f'{kind} GGUF missing (set AUDIBLEZ_MOSS_{kind.upper()})')
+    if missing:
+        return CheckResult('MOSS (llamacpp)', 'warn',
+                           'not usable — ' + '; '.join(missing) + ' — Kokoro will be used instead')
+    detail = f"binary {paths['binary']}"
+    if paths['encoder'] is None:
+        detail += ' — encoder GGUF absent (voice cloning unavailable; set AUDIBLEZ_MOSS_ENCODER)'
+    return CheckResult('MOSS (llamacpp)', 'ok', detail)
+
+
 def check_backend(backend: str) -> CheckResult:
     if backend not in backends.BACKENDS:
         return CheckResult(f'backend {backend}', 'fail',
@@ -127,6 +157,22 @@ def check_backend(backend: str) -> CheckResult:
             return CheckResult(f'backend {backend}', 'fail',
                                f'device not available here (usable: {", ".join(avail)})')
         return CheckResult(f'backend {backend}', 'ok', info.label)
+    if info.engine == 'llamacpp':
+        # Forced -b moss: a missing piece is a FAIL (the user explicitly asked for MOSS), and
+        # names exactly what to install. Encoder absence only warns (cloning-only).
+        paths = backends.moss_paths()
+        miss = []
+        if paths['binary'] is None:
+            miss.append(f"binary '{backends._MOSS_BIN_NAME}' not on PATH (set AUDIBLEZ_MOSS_BIN)")
+        for kind in backends.MOSS_REQUIRED:
+            if paths[kind] is None:
+                miss.append(f'{kind} GGUF missing (set AUDIBLEZ_MOSS_{kind.upper()})')
+        if miss:
+            return CheckResult(f'backend {backend}', 'fail', '; '.join(miss))
+        if paths['encoder'] is None:
+            return CheckResult(f'backend {backend}', 'warn',
+                               f'{info.label} — encoder GGUF absent (voice cloning unavailable)')
+        return CheckResult(f'backend {backend}', 'ok', info.label)
     # mlx engine
     if backend not in avail:
         return CheckResult(f'backend {backend}', 'fail',
@@ -135,9 +181,9 @@ def check_backend(backend: str) -> CheckResult:
 
 
 def run_checks(backend: str = 'cpu') -> list[CheckResult]:
-    """Fast preflight: tools + deps + the selected backend. No model load."""
+    """Fast preflight: tools + deps + MOSS availability + the selected backend. No model load."""
     return [check_ffmpeg(), check_ffprobe(), check_espeak(),
-            check_kokoro(), check_spacy_model(), check_backend(backend)]
+            check_kokoro(), check_spacy_model(), check_moss(), check_backend(backend)]
 
 
 def deep_check(backend: str = 'cpu', voice: str = 'af_sky', tune: bool = False,

@@ -26,25 +26,43 @@ from pathlib import Path
 CACHE_VERSION = 1  # bump to invalidate every entry when the synth contract changes
 
 
-def make_key(engine, repo_id, voice, speed, text, max_sentence_length, spacy_version='',
-             precision='fp32'):
+def make_key(engine, repo_id, voice, speed, text, max_sentence_length=None,
+             spacy_version='', precision='fp32', seed=None, sampling_sig=None):
     """Deterministic content-addressed key for one synthesized sentence.
 
     ``precision`` is part of the key because fp16/bf16 autocast changes the waveform;
     omitting it would let a cache populated under one precision serve another's audio.
+
+    **MOSS-specific knobs (``seed``, ``sampling_sig``)** are folded into the key ONLY when
+    provided — each changes the MOSS waveform (seed reseeds the RNG; ``sampling_sig`` is an
+    opaque fingerprint of the six sampling params). They default to ``None`` and, when
+    ``None``, are omitted from the payload entirely, so the existing Kokoro call path
+    (which passes neither) hashes byte-identically to before — no cache invalidation. For
+    MOSS, ``engine='llamacpp'`` and a ``repo_id`` hashing all three GGUF identities (from
+    :func:`audiblez.backends.moss_repo_id`) already separate its entries from Kokoro's.
+    Likewise ``max_sentence_length`` is optional (MOSS does not split on ``MAX_SENTENCE_LENGTH``);
+    when ``None`` the ``msl`` field is omitted rather than serialized as null.
     """
-    payload = json.dumps({
+    payload = {
         'v': CACHE_VERSION,
         'engine': engine,
         'repo_id': repo_id,
         'voice': voice,
         'speed': round(float(speed), 4),
         'precision': precision,
-        'msl': max_sentence_length,
         'spacy': spacy_version,
         'text': text,
-    }, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    }
+    # Conditionally-present fields: included only when set so callers that omit them keep
+    # their historical hash (Kokoro never passes seed/sampling_sig; MOSS never passes msl).
+    if max_sentence_length is not None:
+        payload['msl'] = max_sentence_length
+    if seed is not None:
+        payload['seed'] = seed
+    if sampling_sig is not None:
+        payload['sampling'] = sampling_sig
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
 
 class SynthCache:
