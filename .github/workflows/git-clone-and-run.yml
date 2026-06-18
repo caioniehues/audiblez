@@ -28,7 +28,9 @@ jobs:
         run: |
           python -m unittest discover -s test -p 'test_text_utils.py' -v
           python -m unittest discover -s test -p 'test_backends.py' -v
+          python -m unittest discover -s test -p 'test_voices.py' -v
           python -m unittest discover -s test -p 'test_synth.py' -v
+          python -m unittest discover -s test -p 'test_m4b.py' -v
           python -m unittest discover -s test -p 'test_cli.py' -v
           python -m unittest discover -s test -p 'test_doctor.py' -v
           python -m unittest discover -s test -p 'test_validation.py' -v
@@ -56,4 +58,7 @@ jobs:
         run: audiblez book.epub
       - name: check book.m4b file exists in current directory
         run: Get-ChildItem -Path .\ -Filter *.m4b
+      - name: run hermetic unit tests
+        run: |
+          python -m pytest test/test_voices.py test/test_cli.py -v
 

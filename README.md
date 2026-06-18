@@ -40,7 +40,16 @@ pip install "audiblez[mlx]"                          # optional: native Apple Si
 Then you can convert an .epub directly with:
 
 ```
-audiblez book.epub -v af_sky
+audiblez book.epub
+```
+
+This uses the default voice `af_heart` (the highest-quality English narrator). Pick a different
+voice, a curated blend, or your own mix with `-v` (see [Supported Voices](#supported-voices)):
+
+```
+audiblez book.epub -v af_bella                 # a different high-quality voice
+audiblez book.epub -v af_warm                  # a curated "house narrator" blend
+audiblez book.epub -v 'af_bella:60,af_heart:40' # your own weighted blend
 ```
 
 It will first create a bunch of `book_chapter_1.wav`, `book_chapter_2.wav`, etc. files in the same directory,
@@ -84,13 +93,17 @@ After many trials, on Windows we recommend to install audiblez in a Python venv:
 By default the audio is generated using a normal speed, but you can make it up to twice slower or faster by specifying a speed argument between 0.5 to 2.0:
 
 ```
-audiblez book.epub -v af_sky -s 1.5
+audiblez book.epub -v af_heart -s 1.5
 ```
 
 ## Supported Voices
 
 Use `-v` option to specify the voice to use. Available voices are listed here.
 The first letter is the language code and the second is the gender of the speaker e.g. `im_nicola` is an italian male voice.
+
+The default voice is **`af_heart`** — the highest-graded English narrator (Kokoro grades it **A**).
+Voices vary a lot in quality (see the grades in `audiblez --help`); the best English ones are
+`af_heart` (A), `af_bella` (A-), `bf_emma` (B-, British) and `af_nicole` (B-).
 
 [For hearing samples of Kokoro-82M voices, go here](https://claudio.uk/posts/audiblez-v4.html)
 
@@ -106,7 +119,36 @@ The first letter is the language code and the second is the gender of the speake
 | 🇧🇷 Brazilian Portuguese | `pf_dora`, `pm_alex`, `pm_santa`                                                                                                                                                                                                           |
 | 🇨🇳 Mandarin Chinese     | `zf_xiaobei`, `zf_xiaoni`, `zf_xiaoxiao`, `zf_xiaoyi`, `zm_yunjian`, `zm_yunxi`, `zm_yunxia`, `zm_yunyang`                                                                                                                                 |
 
-For more detaila about voice quality, check this document: [Kokoro-82M voices](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)
+For more details about voice quality, check this document: [Kokoro-82M voices](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)
+
+### Voice blends ("house narrators")
+
+You can blend voices into a single, consistent narrator. Kokoro averages the voices, so a blend is
+still a fixed preset (no voice cloning, no reference clip) and is just as stable over a whole book —
+it works on every backend, including the Apple-Silicon MLX engine.
+
+**Curated presets** (use the name directly with `-v`):
+
+| Preset | Blend | Character |
+|---|---|---|
+| `af_warm` | Heart + Bella | warm, smooth natural female |
+| `af_expressive` | Heart + Nicole (2:1) | expressive, intimate female |
+| `ab_storyteller` | Heart + Emma | neutral US/UK female storyteller |
+| `am_warm` | Michael + Fenrir | warm male |
+| `am_deep` | Puck + Onyx (2:1) | rich, low male baritone (~100 Hz) |
+
+**Custom blends** — mix any voices with optional weights:
+
+```
+audiblez book.epub -v 'af_bella,af_heart'        # 50/50 blend
+audiblez book.epub -v 'af_bella:60,af_heart:40'  # weighted 60/40 blend
+audiblez book.epub -v 'af_heart:3,am_michael:1'  # mostly Heart with a touch of Michael
+```
+
+In the GUI, the recommended voices and curated blends appear at the top of the Voice dropdown
+(each annotated with its quality grade), and you can type a custom blend like `af_bella:60,af_heart:40`
+directly into the box. For an in-depth comparison of voices, blends, and alternative TTS models, see
+[`docs/tts-naturalness-deep-dive.md`](docs/tts-naturalness-deep-dive.md).
 
 ## Choosing a backend (GPU acceleration)
 
@@ -121,9 +163,9 @@ By default audiblez runs on **CPU**. Use `-b/--backend` to pick a faster engine:
 | MLX     | `-b mlx`  | Apple Silicon   | native Apple engine, fastest on Mac — needs `pip install "audiblez[mlx]"`   |
 
 ```
-audiblez book.epub -v af_sky -b mlx     # Apple Silicon (fastest)
-audiblez book.epub -v af_sky -b cuda    # NVIDIA
-audiblez book.epub -v af_sky -b rocm    # AMD (Linux)
+audiblez book.epub -v af_heart -b mlx     # Apple Silicon (fastest)
+audiblez book.epub -v af_heart -b cuda    # NVIDIA
+audiblez book.epub -v af_heart -b rocm    # AMD (Linux)
 ```
 
 The GUI exposes the same choices as radio buttons — only the backends actually available on your
@@ -180,7 +222,9 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  -v, --voice VOICE     Choose narrating voice: a, b, e, f, h, i, j, p, z
+  -v, --voice VOICE     Narrating voice (default: af_heart). A voice id (e.g. af_heart),
+                        a preset blend (af_warm, af_expressive, ab_storyteller, am_warm,
+                        am_deep), or a custom blend like 'af_bella:60,af_heart:40'.
   -p, --pick            Interactively select which chapters to read in the audiobook
   -s, --speed SPEED     Set speed from 0.5 to 2.0
   -b, --backend {cpu,cuda,rocm,mps,mlx}
@@ -195,9 +239,14 @@ options:
   --seed-lexicon        Write a <book>.lexicon.json of candidate names/acronyms to edit, then exit
   --cache               Cache synthesized sentences and reuse them on re-runs (opt-in)
   --cache-clear         Delete the sentence cache under <output>/.audiblez_cache and exit
+  --chapters CHAPTERS   Comma-separated list or N-M range of chapter indices to convert (e.g. '1,3,5' or '2-6')
+  --chapter-text-dir DIR
+                        Directory containing chapter_<i>.txt files that override the extracted chapter text
 
-example:
-  audiblez book.epub -v af_sky -b mlx
+examples:
+  audiblez book.epub -v af_heart           # best-quality default voice
+  audiblez book.epub -v af_warm -b mlx     # a curated "house narrator" blend
+  audiblez book.epub -v 'af_bella:60,af_heart:40'  # your own weighted blend
 
 to use the GUI, run:
   audiblez-ui

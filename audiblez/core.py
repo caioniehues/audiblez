@@ -26,6 +26,7 @@ from pick import pick
 from audiblez import backends
 from audiblez import gpu
 from audiblez import lexicon
+from audiblez import voices as voicelib
 
 sample_rate = 24000
 _nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
@@ -131,7 +132,8 @@ def extract_book_metadata(book):
 def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_folder: str = '.',
          max_chapters: int | None = None, max_sentences: int | None = None,
          selected_chapters: list | None = None, backend: str = 'cpu', post_event=None,
-         cache_dir: str | None = None, tune: bool = False, precision: str = 'fp32') -> int:
+         chapter_text_dir=None, cache_dir: str | None = None, tune: bool = False,
+         precision: str = 'fp32') -> int:
     if post_event: post_event('CORE_STARTED')
     # Fast preflight: abort in seconds with an actionable message rather than dying
     # 40 minutes in on a missing dep. See `audiblez --doctor` for the same checks.
@@ -175,7 +177,25 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             selected_chapters = pick_chapters(document_chapters)
         else:
             selected_chapters = find_good_chapters(document_chapters)
+    elif all(isinstance(c, int) for c in selected_chapters):
+        # Headless --chapters passes 1-based indices into document_chapters (the GUI passes
+        # chapter objects). Resolve indices to objects; silently drop out-of-range entries.
+        selected_chapters = [document_chapters[i - 1] for i in selected_chapters
+                             if 1 <= i <= len(document_chapters)]
     print_selected_chapters(document_chapters, selected_chapters)
+
+    if chapter_text_dir is not None:
+        # Optional override: replace a selected chapter's extracted text with the contents
+        # of '{chapter_text_dir}/chapter_{i}.txt' when that file exists (i is the 1-based
+        # index into selected_chapters, matching the synthesis loop below). Lets callers
+        # hand-edit/pre-process chapter text before narration. Done before `texts`/stats so
+        # totals and the ETA reflect the overridden content.
+        for i, chapter in enumerate(selected_chapters, start=1):
+            override_path = Path(chapter_text_dir) / f'chapter_{i}.txt'
+            if override_path.exists():
+                chapter.extracted_text = override_path.read_text(encoding='utf-8')
+                print(f'Overriding chapter {i} text from {override_path}')
+
     texts = [c.extracted_text for c in selected_chapters]
 
     has_ffmpeg = shutil.which('ffmpeg') is not None
@@ -201,6 +221,9 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     # its env on first read); persist the results CSV under the output folder.
     gpu.configure_tunableop(tune, backend, results_dir=output_folder)
     synth = build_synthesizer(voice, backend, precision=precision)
+    # Resolve the spec's language code once for the whole run and thread it into each
+    # gen_audio_segments call, instead of re-parsing the spec per chapter.
+    lang_code = voicelib.voice_lang_code(voice)
 
     chapter_wav_files = []
     intro_added = False
@@ -220,6 +243,11 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
                     and _chapter_is_complete(chapter_wav_path, render_signature)):
                 print(f'File for chapter {i} already exists. Skipping')
                 stats.processed_chars += len(text)
+                # On a resumed run this existing wav already contains the prepended intro, so
+                # mark the intro consumed — otherwise it gets re-attached (and re-spoken) on
+                # the next synthesized chapter.
+                if len(text.strip()) >= 10:
+                    intro_added = True
                 if post_event:
                     post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
                 continue
@@ -245,7 +273,7 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         audio_segments = gen_audio_segments(
             synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences,
             chapter_label=f'chapter {i}', dead_letter_path=dead_letter_path,
-            cache=synth_cache, cache_key_fields=cache_fields)
+            cache=synth_cache, cache_key_fields=cache_fields, lang_code=lang_code)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -270,7 +298,9 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     if synth_cache is not None:
         print(f'Sentence cache: {synth_cache.stats()}')
 
-    if has_ffmpeg:
+    if not chapter_wav_files:
+        print('No chapters were synthesized — nothing to assemble into an audiobook.')
+    elif has_ffmpeg:
         # Assemble only valid chapter audio, so one corrupt/short wav can't break the
         # whole m4b; completed chapters always persist as wavs and can also be assembled
         # later with `audiblez --merge` if the run is interrupted before this point.
@@ -337,6 +367,20 @@ def split_long_sentence(text, max_length=MAX_SENTENCE_LENGTH):
     return parts
 
 
+def _kokoro_voice_string_from_comps(comps):
+    """Engine-ready voice string from already-parsed (voice_id, weight) components.
+
+    Same comma-repetition encoding as :func:`audiblez.voices.kokoro_voice_string`, but
+    reuses a parse the caller already did instead of re-parsing the spec.
+    """
+    if len(comps) == 1 and comps[0][1] == 1:
+        return comps[0][0]
+    parts = []
+    for vid, weight in comps:
+        parts.extend([vid] * weight)
+    return ','.join(parts)
+
+
 def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32'):
     """Return ``synth(text, speed) -> list[np.ndarray]`` (float32 @ 24000 Hz).
 
@@ -354,13 +398,24 @@ def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32')
     # and the GUI audition/preview — has phonemization wired before the first synth call.
     set_espeak_library()
     info = backends.BACKENDS[backend]
-    lang_code = voice[0]
+    # Resolve the voice spec (single id, preset blend, or 'a:60,b:40' custom blend) ONCE
+    # into its (voice_id, weight) components, then derive both the language code and the
+    # engine-ready voice string from that single parse — avoids re-parsing the same spec
+    # in voice_lang_code() and kokoro_voice_string() (and again in gen_audio_segments).
+    comps = voicelib.parse_voice_spec(voice)
+    # Kokoro runs ONE G2P language code for the whole pipeline: the first component's lang.
+    # For a cross-dialect blend like the 'ab_storyteller' preset (US af_heart + UK bf_emma)
+    # this means the British voicepack is phonemised under the American 'a' G2P. That is a
+    # known single-lang_code limitation of comma-blending in Kokoro, not a parsing bug here;
+    # a proper fix would require per-voicepack G2P which the engine does not expose.
+    lang_code = comps[0][0][0]
+    kokoro_voice = _kokoro_voice_string_from_comps(comps)
     if info.engine == 'mlx':
         if not backends._mlx_importable():
             raise RuntimeError(
                 "Backend 'mlx' requires mlx-audio on Apple Silicon. "
                 'Install it with: pip install "audiblez[mlx]"')
-        return _build_mlx_synth(voice, lang_code)
+        return _build_mlx_synth(kokoro_voice, lang_code)
     # torch path (cpu/cuda/rocm/mps): KPipeline's device= does a proper model .to(device),
     # which (unlike a global torch.set_default_device) actually works on MPS and avoids
     # mutating process-wide torch state.
@@ -371,7 +426,7 @@ def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32')
         # comprehension is consumed inside the context (nullcontext when precision=fp32).
         with gpu.autocast_context(backend, precision):
             return [to_numpy(audio)
-                    for _gs, _ps, audio in pipeline(text, voice=voice, speed=speed, split_pattern=r'\n\n\n')]
+                    for _gs, _ps, audio in pipeline(text, voice=kokoro_voice, speed=speed, split_pattern=r'\n\n\n')]
     return synth
 
 
@@ -584,10 +639,14 @@ def _split_into_sentences(doc, lang_code):
 def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
                        chapter_label=None, batch_max_chars=BATCH_MAX_CHARS,
                        synth_retries=SYNTH_RETRIES, dead_letter_path=None,
-                       cache=None, cache_key_fields=None):
+                       cache=None, cache_key_fields=None, lang_code=None):
     nlp = load_spacy()
     audio_segments = []
-    sentences = _split_into_sentences(nlp(text), voice[0])
+    # build_synthesizer already parsed the spec; let it pass the resolved lang_code in to
+    # avoid re-parsing per chapter. Fall back to deriving it when called standalone.
+    if lang_code is None:
+        lang_code = voicelib.voice_lang_code(voice)
+    sentences = _split_into_sentences(nlp(text), lang_code)
     if max_sentences:
         sentences = sentences[:max_sentences]
 
@@ -970,11 +1029,13 @@ def _chapter_wav_name(stem, index, voice, xhtml_name):
 
     Control chars, path separators, and spaces in the epub-derived name are replaced with
     ``_`` — a newline would otherwise survive into the ffmpeg concat list and let a crafted
-    epub inject a directive. The reader :func:`find_chapter_wavs` matches this exact scheme,
-    so the two are intentionally co-located and must change together.
+    epub inject a directive. The voice is run through :func:`audiblez.voices.voice_label` so
+    a blend spec (``af_bella:60,af_heart:40`` — illegal ``:`` on Windows) becomes a safe tag.
+    The reader :func:`find_chapter_wavs` matches this exact scheme, so the two are
+    intentionally co-located and must change together.
     """
     safe = re.sub(r'[\x00-\x1f/\\ ]', '_', xhtml_name)
-    return f'{stem}_chapter_{index}_{voice}_{safe}.wav'
+    return f'{stem}_chapter_{index}_{voicelib.voice_label(voice)}_{safe}.wav'
 
 
 def find_chapter_wavs(file_path, voice, output_folder='.'):
@@ -985,7 +1046,7 @@ def find_chapter_wavs(file_path, voice, output_folder='.'):
     the merge order is the synthesis order, not lexicographic (chapter_10 after 9).
     """
     stem = Path(file_path).stem
-    matches = glob(str(Path(output_folder) / f'{stem}_chapter_*_{voice}_*.wav'))
+    matches = glob(str(Path(output_folder) / f'{stem}_chapter_*_{voicelib.voice_label(voice)}_*.wav'))
 
     def chapter_index(path):
         m = re.search(rf'{re.escape(stem)}_chapter_(\d+)_', Path(path).name)
