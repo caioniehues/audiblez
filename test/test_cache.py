@@ -95,6 +95,26 @@ class MossKeyTest(unittest.TestCase):
         base = cache.make_key(text='hi', **_MOSS_FIELDS)
         self.assertNotEqual(base, cache.make_key(text='hi', **{**_MOSS_FIELDS, 'repo_id': 'moss-gguf:0000'}))
 
+    def test_two_clone_refs_do_not_collide_via_voice(self):
+        # End-to-end clone-correctness: core passes backends.clone_voice_id(wav) as `voice`, so
+        # two different reference WAVs synthesizing the SAME sentence must yield different keys
+        # (else a re-run serves the wrong cloned voice — the banned silent-wrongness class).
+        from audiblez import backends
+        import os
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d:
+            ra, rb = os.path.join(d, 'a.wav'), os.path.join(d, 'b.wav')
+            with open(ra, 'wb') as f:
+                f.write(b'voiceA-bytes')
+            with open(rb, 'wb') as f:
+                f.write(b'voiceB-bytes')
+            ka = cache.make_key(text='hi', **{**_MOSS_FIELDS, 'voice': backends.clone_voice_id(ra)})
+            kb = cache.make_key(text='hi', **{**_MOSS_FIELDS, 'voice': backends.clone_voice_id(rb)})
+            self.assertNotEqual(ka, kb)
+            # same reference -> same key (a re-run of the same clone hits the cache)
+            self.assertEqual(ka, cache.make_key(text='hi',
+                             **{**_MOSS_FIELDS, 'voice': backends.clone_voice_id(ra)}))
+
     def test_seed_and_sampling_are_omitted_when_none(self):
         # When seed/sampling_sig are None (the Kokoro path), they must not appear in the payload,
         # so a torch key with no MOSS knobs equals the same call with explicit None.

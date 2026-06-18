@@ -107,6 +107,28 @@ def moss_repo_id() -> str:
     return f'moss-gguf:{digest}'
 
 
+def clone_voice_id(wav_path) -> str:
+    """Content-addressed ``voice`` value for a MOSS voice-clone reference WAV.
+
+    For cloning, the reference WAV **is** the voice, so it must enter the cache key — two
+    different reference clips synthesizing the same sentence produce different audio and must
+    not collide on a constant ``voice='clone'`` (that would serve stale wrong-voice audio on a
+    re-run — the silent-wrongness class :doc:`cache-and-resilience` bans). ``core`` passes the
+    result straight in as :func:`audiblez.cache.make_key`'s ``voice`` (reusing the existing
+    voice axis — no new key field). Hashes the file **contents** (not name/mtime), in chunks so
+    a large reference never loads fully into memory; a clip's bytes are tiny vs. the 8 GB GGUFs,
+    so a content hash is cheap and exact here (unlike :func:`moss_repo_id`).
+
+    Raises :class:`FileNotFoundError`/:class:`OSError` if the reference is unreadable — a clone
+    run with no usable reference must fail loud, never silently fall back to a default voice.
+    """
+    h = hashlib.sha256()
+    with open(wav_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):  # 1 MiB chunks
+            h.update(chunk)
+    return f'clone:{h.hexdigest()[:8]}'
+
+
 # The six MOSS sampling parameters, PINNED to fixed defaults (spec "REQUEST" line) so the
 # sentence cache actually hits across runs. Changing any value here changes the waveform, so
 # it flows into the cache key via moss_sampling_sig(). Order is fixed for a stable signature.

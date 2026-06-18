@@ -174,6 +174,32 @@ class MossDiscoveryTest(unittest.TestCase):
             # all-absent still yields a deterministic id (basename:absent triples)
             self.assertEqual(backends.moss_repo_id(), backends.moss_repo_id())
 
+    def test_clone_voice_id_same_ref_same_id_diff_ref_diff_id(self):
+        import os
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d:
+            ref_a = os.path.join(d, 'a.wav')
+            ref_b = os.path.join(d, 'b.wav')
+            with open(ref_a, 'wb') as f:
+                f.write(b'RIFF....voiceA....')
+            with open(ref_b, 'wb') as f:
+                f.write(b'RIFF....voiceB....')
+            id_a = backends.clone_voice_id(ref_a)
+            id_b = backends.clone_voice_id(ref_b)
+            self.assertTrue(id_a.startswith('clone:'))
+            self.assertEqual(id_a, backends.clone_voice_id(ref_a))   # same bytes -> same id
+            self.assertNotEqual(id_a, id_b)                          # diff bytes -> diff id
+            # content-addressed: a renamed copy of A's bytes hashes identically to A
+            ref_a2 = os.path.join(d, 'renamed.wav')
+            with open(ref_a2, 'wb') as f:
+                f.write(b'RIFF....voiceA....')
+            self.assertEqual(id_a, backends.clone_voice_id(ref_a2))
+
+    def test_clone_voice_id_missing_ref_raises(self):
+        # A clone run with no usable reference must fail loud, never silently use a default voice.
+        with self.assertRaises((FileNotFoundError, OSError)):
+            backends.clone_voice_id('/no/such/reference.wav')
+
     def test_sampling_sig_deterministic_and_override_sensitive(self):
         # The canonical default signature is stable run-to-run, includes all six params, and
         # changes when any one is overridden (so it can never silently drop a sampling change).
