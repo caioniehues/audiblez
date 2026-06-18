@@ -96,6 +96,11 @@ MOSS_SAMPLING = {
 SAMPLING_DEFAULTS = MOSS_SAMPLING     # canonical alias (the name T3/T4 reference)
 MOSS_MAX_NEW_TOKENS = 2048            # per-request cap sent to the child
 MOSS_SAMPLE_RATE = 24000              # the child writes 24 kHz wavs; must match `sample_rate`
+# Fixed `--serve` invocation flags T1's binary (branch moss-serve-json-v1) requires at spawn.
+MOSS_LANGUAGE = 'en'                  # --language
+MOSS_NGL = '-1'                       # -ngl: offload all layers to the GPU
+MOSS_MAX_PROMPT_FRAMES = '512'       # --max-prompt-frames (backbone ctx sizing)
+MOSS_MAX_RAW_FRAMES = '768'           # --max-raw-frames (audio-decoder ctx sizing)
 
 # Failure-vs-death tuning (the two-axis model; see _build_llamacpp_synth).
 MOSS_DEATHS_BEFORE_POISON = 2         # K: consecutive deaths on ONE sentence -> dead-letter it
@@ -657,8 +662,13 @@ class MossProcess:
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────
     def _command(self):
+        # Exact invocation T1's --serve binary (moss-serve-json-v1) expects; the fixed
+        # frame caps size the resident backbone/audio contexts at startup (worst-case).
         cmd = [self.binary, '--serve', '-m', self.backbone,
-               '--audio-decoder-model', self.decoder]
+               '--audio-decoder-model', self.decoder,
+               '--language', MOSS_LANGUAGE, '-ngl', MOSS_NGL,
+               '--max-prompt-frames', MOSS_MAX_PROMPT_FRAMES,
+               '--max-raw-frames', MOSS_MAX_RAW_FRAMES]
         if self.clone_ref and self.encoder:
             cmd += ['--audio-encoder-model', self.encoder, '--reference-audio', self.clone_ref]
         return cmd
