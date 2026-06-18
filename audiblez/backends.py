@@ -130,8 +130,9 @@ def clone_voice_id(wav_path) -> str:
 
 
 # The six MOSS sampling parameters, PINNED to fixed defaults (spec "REQUEST" line) so the
-# sentence cache actually hits across runs. Changing any value here changes the waveform, so
-# it flows into the cache key via moss_sampling_sig(). Order is fixed for a stable signature.
+# sentence cache actually hits across runs. This is the SINGLE source: core aliases it as
+# `core.MOSS_SAMPLING` (used in the synth request AND, hashed, in the cache key), so the two
+# can never drift to different values. Changing any value here changes the waveform.
 MOSS_SAMPLING_DEFAULTS = {
     'text_temperature': 1.5,
     'text_top_k': 50,
@@ -143,14 +144,13 @@ MOSS_SAMPLING_DEFAULTS = {
 
 
 def moss_sampling_sig(sampling: dict | None = None) -> str:
-    """Canonical fingerprint of the MOSS sampling params for the cache key (single source).
+    """Canonical value-level fingerprint of the MOSS sampling params (human-readable form).
 
-    ``core`` passes the result straight into :func:`audiblez.cache.make_key` as
-    ``sampling_sig`` and the same dict into the resident-pipe ``synth`` request, so the cached
-    audio and the synthesized audio can never disagree on sampling. Defaults to
-    :data:`MOSS_SAMPLING_DEFAULTS`; pass a dict to override individual values (merged onto the
-    defaults). Deterministic, sorted, value-typed — exposing it here keeps every call-site on
-    one format instead of each hand-rolling a string.
+    A deterministic, sorted, value-typed ``k=v;`` rendering of the pinned sampling dict, exposed
+    for doctor/diagnostics. The cache KEY uses ``core._moss_sampling_sig`` (a sha256 over this
+    same single :data:`MOSS_SAMPLING_DEFAULTS` dict, aliased as ``core.MOSS_SAMPLING``); both read
+    the one source, so cached audio and synthesized audio can never disagree on sampling. Defaults
+    to :data:`MOSS_SAMPLING_DEFAULTS`; pass a dict to override individual values (merged on top).
     """
     merged = dict(MOSS_SAMPLING_DEFAULTS)
     if sampling:

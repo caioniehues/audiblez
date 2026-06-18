@@ -594,14 +594,26 @@ class MainWindow(wx.Frame):
 
     def _synth_to_temp(self, core, text, voice, speed):
         """Synthesize text to a temp wav and return its path (or None if no audio)."""
-        synth = self._cached_synth(core, voice, getattr(self, 'selected_backend', 'cpu'))
+        backend = getattr(self, 'selected_backend', 'cpu')
+        synth = self._cached_synth(core, voice, backend)
         core.load_spacy()
         audio_segments = core.gen_audio_segments(synth, text, voice=voice, speed=speed)
         if not audio_segments:
             return None
         with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             soundfile.write(tmp, np.concatenate(audio_segments), core.sample_rate)
-            return tmp.name
+            path = tmp.name
+        # MOSS (engine='llamacpp') synthesizes at 1.0 — its synth IGNORES speed — so the audition
+        # must be re-stretched via atempo to match what the real render/trailer produce (US-26);
+        # without this, preview always plays at 1.0 (a silent speed mismatch). Kokoro baked speed
+        # into the samples already, so this is MOSS-only. Best-effort: if ffmpeg is absent the
+        # preview falls back to 1.0 with a warning rather than crashing the GUI.
+        if core.backends.BACKENDS[backend].engine == 'llamacpp':
+            try:
+                core._apply_atempo(path, speed)
+            except RuntimeError as e:
+                print(f'Preview tempo not applied: {e}')
+        return path
 
     def on_preview_chapter(self, event):
         button = event.GetEventObject()
@@ -756,7 +768,13 @@ class CoreThread(threading.Thread):
         self.params = params
 
     def run(self):
-        from audiblez.core import main, MossRunAborted
+        import audiblez.core as _core
+        from audiblez.core import main
+        # Resolve MossRunAborted defensively, mirroring cli.py: a stubbed/partial core that the
+        # CLI tolerates would otherwise ImportError this GUI thread (the "GUI is the one that
+        # gets missed" trap). The sentinel is never raised, so the handler simply never matches.
+        class _UnreachableAbort(BaseException): pass
+        MossRunAborted = getattr(_core, 'MossRunAborted', _UnreachableAbort)
         try:
             main(**self.params, post_event=self.post_event)
         # MossRunAborted is a BaseException (so it propagates through core's broad

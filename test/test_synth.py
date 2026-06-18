@@ -6,6 +6,7 @@ engines are faked.
 """
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -407,6 +408,50 @@ class MossProcessTransportTest(unittest.TestCase):
                                 work_dir=tempfile.gettempdir(), popen_factory=boom)
         with self.assertRaises(core.MossRunAborted):
             proc.start()
+
+    # ── wedged-but-alive child: the unbounded-stdin-write deadlock (engine review HIGH) ──
+    # bufsize=0 means a write to a full stdin pipe blocks at the OS level with no timeout, so a
+    # child that is alive (poll() is None) but not draining its stdin must NOT hang synth/close
+    # forever — _write bounds the write on a watchdog thread and the caller treats a stuck write
+    # as a death. A never-set Event makes the fake child's write block indefinitely.
+
+    @staticmethod
+    def _wedged_proc(killed_flag):
+        blocked = threading.Event()  # never set -> write() blocks forever
+
+        class _Stdin:
+            def write(self, data): blocked.wait()
+            def flush(self): pass
+
+        class _Proc:
+            def __init__(self): self.stdin = _Stdin(); self.stdout = None
+            def poll(self): return None          # alive
+            def kill(self): killed_flag.append(True)
+            def wait(self, timeout=None): return 0
+        return _Proc()
+
+    def _moss(self):
+        return core.MossProcess(backbone='bb', decoder='dec', work_dir=tempfile.mkdtemp(),
+                                popen_factory=lambda *a, **k: None)
+
+    def test_write_returns_false_when_child_wedged(self):
+        proc = self._moss()
+        proc.proc = self._wedged_proc([])
+        self.assertFalse(proc._write(b'x\n', timeout=0.2))  # bounded, not a hard hang
+
+    def test_synth_raises_mossdeath_when_write_wedged(self):
+        proc = self._moss()
+        proc.proc = self._wedged_proc([])
+        with self.assertRaises(core.MossDeath):
+            proc.synth('hello', timeout=0.2)
+
+    def test_close_kills_wedged_child_instead_of_hanging(self):
+        killed = []
+        proc = self._moss()
+        proc.proc = self._wedged_proc(killed)
+        with mock.patch.object(core, 'MOSS_SHUTDOWN_WRITE_TIMEOUT', 0.2):
+            proc.close()  # must escalate to kill, not block on a graceful exit it can't perform
+        self.assertEqual(killed, [True])
 
 
 @unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")

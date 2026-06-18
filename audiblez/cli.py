@@ -105,9 +105,9 @@ def cli_main():
                         help='Reference WAV for zero-shot voice cloning (MOSS engine only). The '
                              'audiobook is narrated in the reference voice; encoded once at start.')
     parser.add_argument('--coarse', default=False, action='store_true',
-                        help='Opt-in coarse-chunk mode (MOSS engine): synthesize a paragraph as '
-                             'one utterance for ~1.5x more speed, at the cost of sentence-level '
-                             'edit granularity. No-op on Kokoro.')
+                        help='(EXPERIMENTAL, not yet wired) Opt-in coarse-chunk mode (MOSS engine): '
+                             'intended to synthesize a paragraph as one utterance for more speed. '
+                             'Currently a no-op — accepted but synthesis stays sentence-level.')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)

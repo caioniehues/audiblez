@@ -132,6 +132,40 @@ class MossKeyTest(unittest.TestCase):
         self.assertNotEqual(no_msl, with_msl)
 
 
+@unittest.skipIf(_CORE_ERR is not None, f"audiblez.core unavailable: {_CORE_ERR}")
+class RenderSignatureTest(unittest.TestCase):
+    """The chapter `.sig` resume gate (core._render_signature) — runs BEFORE the sentence cache,
+    so it must capture every MOSS waveform axis too, or a model/sampling/clone swap reuses a stale
+    chapter wav (silent-wrongness). Kokoro must keep emitting the pre-MOSS string (no cache bust).
+    """
+
+    def test_kokoro_signature_has_no_moss_axes(self):
+        # A torch backend (and the backend=None default) must emit exactly lex;speed;precision —
+        # unchanged from before the MOSS axes existed, so old .sig files stay valid.
+        sig = core._render_signature({}, 1.0, 'fp32', backend='cpu')
+        self.assertNotIn('engine=llamacpp', sig)
+        self.assertEqual(sig, core._render_signature({}, 1.0, 'fp32'))
+
+    def test_moss_signature_includes_model_seed_and_sampling(self):
+        sig = core._render_signature({}, 1.0, 'fp32', backend='moss')
+        self.assertIn('engine=llamacpp', sig)
+        self.assertIn('repo=', sig)
+        self.assertIn(f'seed={core.MOSS_SEED}', sig)
+        self.assertIn('sampling=', sig)
+
+    def test_clone_ref_changes_moss_signature(self):
+        # Two different clone refs (with a constant voice) must NOT share a .sig — else clone-ref-B
+        # re-run silently reuses clone-ref-A's chapter wav (the filename collision cache-rev flagged).
+        with TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / 'a.wav', Path(tmp) / 'b.wav'
+            a.write_bytes(b'AAAA'); b.write_bytes(b'BBBB')
+            none = core._render_signature({}, 1.0, 'fp32', backend='moss')
+            sig_a = core._render_signature({}, 1.0, 'fp32', backend='moss', clone_ref=str(a))
+            sig_b = core._render_signature({}, 1.0, 'fp32', backend='moss', clone_ref=str(b))
+            self.assertNotEqual(sig_a, none)
+            self.assertNotEqual(sig_a, sig_b)
+
+
 class SynthCacheTest(unittest.TestCase):
     def test_miss_then_put_then_hit(self):
         with TemporaryDirectory() as tmp:
