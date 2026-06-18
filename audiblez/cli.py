@@ -8,6 +8,11 @@ from audiblez import voices as voicelib
 from audiblez import backends
 
 
+class _UnreachableAbort(BaseException):
+    """Sentinel `except` target used only when a (stubbed) core lacks ``MossRunAborted`` —
+    it is never raised, so the handler simply never matches."""
+
+
 def parse_chapter_spec(spec: str) -> list[int]:
     """Parse a --chapters spec like '1,3,5' or '1-4,7' into a sorted, unique list of 1-based ints.
 
@@ -96,6 +101,13 @@ def cli_main():
                         help='GPU compute precision via autocast (cuda/rocm only). fp16/bf16 are '
                              'faster but change the waveform — audition before a full run. '
                              'Default: fp32. No-op on cpu/mlx.')
+    parser.add_argument('--clone-ref', dest='clone_ref', default=None, metavar='WAV',
+                        help='Reference WAV for zero-shot voice cloning (MOSS engine only). The '
+                             'audiobook is narrated in the reference voice; encoded once at start.')
+    parser.add_argument('--coarse', default=False, action='store_true',
+                        help='Opt-in coarse-chunk mode (MOSS engine): synthesize a paragraph as '
+                             'one utterance for ~1.5x more speed, at the cost of sentence-level '
+                             'edit granularity. No-op on Kokoro.')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -229,10 +241,22 @@ def cli_main():
 
     cache_dir = os.path.join(args.output, '.audiblez_cache') if args.cache else None
     chapter_text_dir = Path(args.chapter_text_dir) if args.chapter_text_dir is not None else None
-    from audiblez.core import main
-    failures = main(args.epub_file_path, args.voice, args.pick, args.speed, args.output, backend=backend,
-                    selected_chapters=selected_chapters, chapter_text_dir=chapter_text_dir,
-                    cache_dir=cache_dir, tune=args.tune, precision=args.precision)
+    from audiblez import core as _core
+    main = _core.main
+    # Resolve the abort type defensively: a stubbed core (used by some hermetic CLI tests)
+    # may not define it, and a missing symbol must not turn into an ImportError at startup.
+    MossRunAborted = getattr(_core, 'MossRunAborted', _UnreachableAbort)
+    try:
+        failures = main(args.epub_file_path, args.voice, args.pick, args.speed, args.output, backend=backend,
+                        selected_chapters=selected_chapters, chapter_text_dir=chapter_text_dir,
+                        cache_dir=cache_dir, tune=args.tune, precision=args.precision,
+                        clone_ref=args.clone_ref, coarse=args.coarse)
+    except MossRunAborted as e:
+        # The MOSS engine couldn't spawn or the circuit-breaker tripped. Abort LOUD (never a
+        # silent swap to Kokoro — that would change the voice mid-book). Partial chapters +
+        # dead-letters are preserved on disk for a resume.
+        print(f'\033[91mRun aborted: {e}\033[0m')
+        sys.exit(2)
     # Non-zero exit on a degraded run (sentences dead-lettered -> gaps), so scripts/CI notice.
     sys.exit(1 if failures else 0)
 

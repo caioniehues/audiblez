@@ -7,13 +7,18 @@ import spacy
 import ebooklib
 import soundfile
 import numpy as np
+import os
 import json
 import time
 import shutil
 import subprocess
 import platform
 import re
+import hashlib
+import tempfile
+import threading
 from glob import glob
+from dataclasses import dataclass
 from types import SimpleNamespace
 from tabulate import tabulate
 from pathlib import Path
@@ -63,6 +68,94 @@ FALLBACK_SILENCE_CHARS_PER_SEC = 15   # gap length (proportional to text) for a 
 
 TRAILER_SENTENCES_PER_CHAPTER = 2     # opening sentences sampled per chapter in --trailer
 TRAILER_GAP_SECONDS = 1.0             # silent gap between trailer segments
+
+# ─── MOSS resident-pipe engine (engine='llamacpp') ──────────────────────────────────
+# Binary + GGUF identities for the OpenMOSS llama.cpp fork. The resident child loads these
+# once and synthesizes sentence-by-sentence over a stdin/stdout pipe (ADR 0002, the impl
+# spec docs/moss-coprocess-spec.md). All knobs that change the waveform are PINNED here so
+# the sentence cache hits across runs (a drifted sampling param silently breaks every hit).
+MOSS_BINARY = 'llama-moss-tts'        # default name on PATH; the real path comes from backends.moss_paths()
+# GGUF basenames are kept only for the test/odd-layout `gguf_dir=` override in
+# _build_llamacpp_synth; the real run resolves all paths via backends.moss_paths() (T3, the
+# single source of truth that --doctor preflights), NOT these.
+MOSS_BACKBONE_GGUF = 'moss_delay_firstclass_Q5_K_M.gguf'
+MOSS_DECODER_GGUF = 'moss_tts_audio_decoder_f16.gguf'
+MOSS_ENCODER_GGUF = 'moss_tts_audio_encoder_f16.gguf'   # only for voice cloning (Phase-2)
+
+MOSS_SEED = 42                        # pinned: the cache key must be stable across runs
+# The six sampling params, pinned to fixed defaults (ADR 0005). Order is irrelevant — the
+# cache fingerprints the dict by sorted keys (see _moss_sampling_sig).
+MOSS_SAMPLING = {
+    'text_temperature': 1.5,
+    'text_top_k': 50,
+    'audio_temperature': 1.7,
+    'audio_top_p': 0.8,
+    'audio_top_k': 25,
+    'audio_repetition_penalty': 1.0,
+}
+SAMPLING_DEFAULTS = MOSS_SAMPLING     # canonical alias (the name T3/T4 reference)
+MOSS_MAX_NEW_TOKENS = 2048            # per-request cap sent to the child
+MOSS_SAMPLE_RATE = 24000              # the child writes 24 kHz wavs; must match `sample_rate`
+
+# Failure-vs-death tuning (the two-axis model; see _build_llamacpp_synth).
+MOSS_DEATHS_BEFORE_POISON = 2         # K: consecutive deaths on ONE sentence -> dead-letter it
+MOSS_MAX_CONSECUTIVE_DEATHS = MOSS_DEATHS_BEFORE_POISON  # canonical alias for the same K
+MOSS_RESPONSE_TIMEOUT_FLOOR = 30.0    # seconds; a no-response past this == death
+MOSS_TIMEOUT_SECONDS_PER_CHAR = 0.25  # deadline scales with sentence length above the floor
+MOSS_RESTART_WINDOW_SECONDS = 120.0   # circuit-breaker: look at restarts in this trailing window
+MOSS_MAX_RESTARTS_IN_WINDOW = 5       # ...abort the run if more than this many fall inside it
+MOSS_SPAWN_READY_TIMEOUT = 180.0      # cold-start model load can take a while (RADV compile)
+
+
+class MossError(Exception):
+    """A `status:"error"` response from a HEALTHY child (real synth failure, not a death).
+
+    Raised by the synth closure so the existing `_synth_one_or_silence` dead-letters the
+    sentence and splices silence — the child stays alive for the next sentence.
+    """
+
+
+class MossPermanentError(MossError, ValueError):
+    """A deterministic MOSS failure that retrying cannot fix (bad_request/empty_audio, or a
+    poison-pill sentence that keeps killing the child). Subclasses ``ValueError`` so it is a
+    member of :data:`_PERMANENT_SYNTH_ERRORS`: ``_retry`` re-raises it immediately instead of
+    re-running the same losing call (or re-spinning a child-killing sentence) N times."""
+
+
+class MossDeath(Exception):
+    """The child DIED mid-request (EOF on stdout / ``poll() is not None`` / response-timeout).
+
+    Internal to :class:`MossProcess` / the closure's restart loop — never reaches
+    ``_synth_one_or_silence``. The closure restarts the child and re-dispatches the SAME
+    sentence (infra fault, not the sentence's fault — don't dead-letter the first death).
+    """
+
+
+class MossRunAborted(BaseException):
+    """Abort the whole run, LOUD: the child can't spawn, or the circuit-breaker tripped.
+
+    Deliberately a ``BaseException`` (like ``KeyboardInterrupt``), NOT ``Exception``: the
+    unchanged ``_synth_one_or_silence`` / ``_synth_batch`` / ``_retry`` all ``except
+    Exception`` broadly, so a plain exception here would be swallowed into silence + a
+    dead-letter and the run would CONTINUE — turning a crash storm into a silently all-silence
+    book reported as success-with-gaps (the banned ADR-0005 outcome). As a ``BaseException`` it
+    propagates THROUGH those handlers up to ``core.main`` -> a non-zero exit, never a swap to
+    Kokoro (changing the voice mid-book is a banned silent-wrongness class).
+
+    Two named subclasses distinguish the cause (both still caught by ``except MossRunAborted``):
+    :class:`MossSpawnError` (child won't spawn) and :class:`MossCircuitBreakerError` (restart
+    rate exceeded).
+    """
+
+
+class MossSpawnError(MossRunAborted):
+    """The resident child could not be spawned (missing/broken binary). Abort loud, never swap
+    to Kokoro. A subclass of :class:`MossRunAborted`, so callers catching the base type catch it."""
+
+
+class MossCircuitBreakerError(MossRunAborted):
+    """The restart rate exceeded the circuit-breaker threshold (systemic failure, e.g. VRAM
+    exhaustion mid-book). A subclass of :class:`MossRunAborted` (caught by the base handler)."""
 
 
 def to_numpy(audio):
@@ -133,7 +226,7 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
          max_chapters: int | None = None, max_sentences: int | None = None,
          selected_chapters: list | None = None, backend: str = 'cpu', post_event=None,
          chapter_text_dir=None, cache_dir: str | None = None, tune: bool = False,
-         precision: str = 'fp32') -> int:
+         precision: str = 'fp32', clone_ref: str | None = None, coarse: bool = False) -> int:
     if post_event: post_event('CORE_STARTED')
     # Fast preflight: abort in seconds with an actionable message rather than dying
     # 40 minutes in on a missing dep. See `audiblez --doctor` for the same checks.
@@ -167,7 +260,7 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     if cache_dir:
         from audiblez import cache as cache_mod
         synth_cache = cache_mod.SynthCache(cache_dir)
-        cache_fields = _cache_key_fields(backend, voice, speed, precision)
+        cache_fields = _cache_key_fields(backend, voice, speed, precision, clone_ref=clone_ref)
         print(f'Sentence cache enabled at {cache_dir}')
 
     document_chapters = find_document_chapters_and_extract_texts(book)
@@ -229,7 +322,13 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     # GPU GEMM autotuning must be configured before the first synth (TunableOp caches
     # its env on first read); persist the results CSV under the output folder.
     gpu.configure_tunableop(tune, backend, results_dir=output_folder)
-    synth = build_synthesizer(voice, backend, precision=precision)
+    # Slice-0: one SynthParams threads voice/backend/precision/clone_ref/coarse through the
+    # engine seam (so a new knob can't be wired into cli.py and missed in ui.py). The resident
+    # MOSS child (engine='llamacpp') is spawned here and MUST be torn down in the finally below,
+    # or an 8 GB-VRAM child is orphaned when synthesis raises or the run ends.
+    synth = build_synthesizer(params=SynthParams(
+        voice=voice, backend=backend, precision=precision, clone_ref=clone_ref, coarse=coarse),
+        work_dir=output_folder)
     # Resolve the spec's language code once for the whole run and thread it into each
     # gen_audio_segments call, instead of re-parsing the spec per chapter.
     lang_code = voicelib.voice_lang_code(voice)
@@ -238,7 +337,8 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     intro_added = False
     total_failures = 0  # dead-lettered sentences across the whole book (degraded-run signal)
     render_signature = _render_signature(book_lexicon, speed, precision)
-    for i, chapter in enumerate(selected_chapters, start=1):
+    try:
+      for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
         chapter_wav_path = Path(output_folder) / _chapter_wav_name(
@@ -286,6 +386,12 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
+            # MOSS synthesizes at 1.0 (no speed knob); apply playback speed here, once per
+            # chapter, via ffmpeg atempo (ADR 0002) so the speed-agnostic MOSS sentence cache
+            # is re-stretched rather than re-synthesized. Kokoro already baked speed into the
+            # samples, so this is MOSS-only (engine='llamacpp'); never double-stretch.
+            if backends.BACKENDS[backend].engine == 'llamacpp':
+                _apply_atempo(chapter_wav_path, speed)
             # Record the render signature so a later run regenerates this chapter if the
             # lexicon/speed/precision changed (see _chapter_is_complete).
             Path(chapter_wav_path).with_suffix('.sig').write_text(render_signature, encoding='utf-8')
@@ -303,6 +409,11 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         else:
             print(f'Warning: No audio generated for chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
+    finally:
+        # Tear the engine down whatever happens — a normal finish, a MossRunAborted (which
+        # propagates as a BaseException through gen_audio_segments' broad excepts), or any
+        # other exception — so the resident MOSS child never leaks its VRAM (no-op for Kokoro).
+        getattr(synth, 'close', lambda: None)()
 
     if synth_cache is not None:
         print(f'Sentence cache: {synth_cache.stats()}')
@@ -390,23 +501,65 @@ def _kokoro_voice_string_from_comps(comps):
     return ','.join(parts)
 
 
-def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32'):
+@dataclass(frozen=True)
+class SynthParams:
+    """The synth-path parameters that ALL three entry points (cli/ui/core) must agree on.
+
+    Slice-0 unification: collapsing voice/backend/precision (and the Phase-2 ``clone_ref`` /
+    ``coarse`` knobs) into one object means a new synth knob is added in ONE place and threaded
+    through ``build_synthesizer`` / the cache key uniformly — it can't be wired into cli.py and
+    silently missed in ui.py (the historically-missed entry point; see architecture.md). Run
+    orchestration (file_path, output_folder, selected_chapters, ...) is deliberately NOT here —
+    only what shapes the waveform / the engine.
+
+    ``clone_ref`` (a reference WAV for zero-shot voice cloning) and ``coarse`` (opt-in
+    coarse-chunk mode) are accepted now so later slices don't re-thread three entry points.
+    """
+    voice: str
+    backend: str = 'cpu'
+    precision: str = 'fp32'
+    clone_ref: str | None = None
+    coarse: bool = False
+
+
+def build_synthesizer(voice=None, backend: str = 'cpu', precision: str = 'fp32',
+                      clone_ref=None, *, params: 'SynthParams | None' = None,
+                      moss_factory=None, work_dir=None):
     """Return ``synth(text, speed) -> list[np.ndarray]`` (float32 @ 24000 Hz).
 
     Torch backends (cpu/cuda/rocm/mps) set the process-global default device and build
-    a Kokoro KPipeline; the mlx backend loads the Apple-Silicon-native Kokoro model.
-    Both engines emit identical-format audio, so everything downstream is engine-agnostic.
+    a Kokoro KPipeline; the mlx backend loads the Apple-Silicon-native Kokoro model; the
+    'llamacpp' engine spawns the resident MOSS co-process. All engines emit identical-format
+    audio, so everything downstream is engine-agnostic. The returned ``synth`` carries a
+    ``.close`` attribute (a no-op for Kokoro/mlx; the MOSS child teardown for 'llamacpp') so
+    ``core.main`` can release the engine in a ``finally`` without unpacking a tuple — that
+    keeps the bare-callable contract every existing caller and test mock relies on.
+
+    Accepts EITHER a :class:`SynthParams` (slice-0 unification — the preferred call) OR the
+    legacy ``voice``/``backend``/``precision`` kwargs, so the three entry points and the
+    existing tests stay green during the migration.
 
     ``precision`` ('fp32' | 'fp16' | 'bf16') wraps the torch synth call in autocast for
     GPU throughput; it is a no-op on cpu/mlx/mps (see :mod:`audiblez.gpu`). Lower
     precision changes the waveform, so it is opt-in and should be auditioned.
     """
+    if params is None:
+        if voice is None:
+            raise ValueError('build_synthesizer requires a voice (or a SynthParams)')
+        params = SynthParams(voice=voice, backend=backend, precision=precision, clone_ref=clone_ref)
+    voice, backend, precision, clone_ref = (
+        params.voice, params.backend, params.precision, params.clone_ref)
     if backend not in backends.BACKENDS:
         raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
+    info = backends.BACKENDS[backend]
+    if info.engine == 'llamacpp':
+        # MOSS resident co-process: no espeak / Kokoro voice parsing — it owns its own g2p.
+        # (`voice`/clone_ref select the narration; speed is applied downstream via atempo.)
+        return _build_llamacpp_synth(voice, None, clone_ref=clone_ref,
+                                     moss_factory=moss_factory, work_dir=work_dir)
     # Register espeak here too (idempotent), so every synth entry point — main, the trailer,
     # and the GUI audition/preview — has phonemization wired before the first synth call.
     set_espeak_library()
-    info = backends.BACKENDS[backend]
     # Resolve the voice spec (single id, preset blend, or 'a:60,b:40' custom blend) ONCE
     # into its (voice_id, weight) components, then derive both the language code and the
     # engine-ready voice string from that single parse — avoids re-parsing the same spec
@@ -424,7 +577,9 @@ def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32')
             raise RuntimeError(
                 "Backend 'mlx' requires mlx-audio on Apple Silicon. "
                 'Install it with: pip install "audiblez[mlx]"')
-        return _build_mlx_synth(kokoro_voice, lang_code)
+        synth = _build_mlx_synth(kokoro_voice, lang_code)
+        synth.close = lambda: None
+        return synth
     # torch path (cpu/cuda/rocm/mps): KPipeline's device= does a proper model .to(device),
     # which (unlike a global torch.set_default_device) actually works on MPS and avoids
     # mutating process-wide torch state.
@@ -436,6 +591,7 @@ def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32')
         with gpu.autocast_context(backend, precision):
             return [to_numpy(audio)
                     for _gs, _ps, audio in pipeline(text, voice=kokoro_voice, speed=speed, split_pattern=r'\n\n\n')]
+    synth.close = lambda: None  # Kokoro holds no resident child; teardown is a no-op
     return synth
 
 
@@ -452,6 +608,365 @@ def _build_mlx_synth(voice: str, lang_code: str):
         return [np.asarray(seg.audio).reshape(-1)
                 for seg in model.generate(text, voice=voice, speed=speed,
                                           lang_code=lang_code, split_pattern=r'\n\n\n')]
+    return synth
+
+
+def _moss_sampling_sig(sampling=None):
+    """Stable short fingerprint of the six pinned sampling params (order-independent)."""
+    payload = json.dumps(sampling if sampling is not None else MOSS_SAMPLING,
+                         sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+class MossProcess:
+    """Resident `llama-moss-tts --serve` child, owned over a stdin/stdout pipe.
+
+    Dumb transport: spawn, speak the newline-JSON protocol from ``docs/moss-coprocess-spec.md``
+    (request/OK/error/shutdown), hand audio off via 16-bit WAV files (read back with soundfile
+    as float32), and drain stderr continuously so a full stderr pipe can't deadlock the child.
+    Policy (retry / restart / dead-letter / circuit-breaker) lives in the synth closure; this
+    class only RAISES :class:`MossDeath` (EOF / dead poll / response-timeout) and
+    :class:`MossError` (a ``status:"error"`` line), keeping both testable against a fake process.
+
+    ``popen_factory`` / ``wav_reader`` are injectable so tests drive a scripted fake child with
+    no binary, GPU, or real WAVs.
+    """
+
+    def __init__(self, backbone, decoder, encoder=None, clone_ref=None, binary=None,
+                 work_dir=None, popen_factory=None, wav_reader=None,
+                 ready_timeout=MOSS_SPAWN_READY_TIMEOUT):
+        self.binary = str(binary) if binary else MOSS_BINARY  # resolved path (or bare name on PATH)
+        self.backbone = str(backbone)
+        self.decoder = str(decoder)
+        self.encoder = str(encoder) if encoder else None
+        self.clone_ref = str(clone_ref) if clone_ref else None
+        # Per-instance handoff dir for the request WAVs, kept OUT of the user's output folder
+        # (those wavs are transient — one per sentence — and would otherwise litter it). Cleaned
+        # up in close(). A unique name per process avoids two runs colliding on req-N.wav.
+        base = Path(work_dir) if work_dir else Path(tempfile.gettempdir())
+        self.work_dir = base / f'.moss_handoff_{os.getpid()}_{id(self)}'
+        self._popen_factory = popen_factory or subprocess.Popen
+        # soundfile.read by default; injectable so a fake child's tiny WAVs are read in tests.
+        self._wav_reader = wav_reader or (lambda path: soundfile.read(str(path), dtype='float32'))
+        self._ready_timeout = ready_timeout
+        self.proc = None
+        self._req_id = 0
+        self._stderr_thread = None
+        self._stderr_log = None
+        self.spawns = 0  # how many times the child has been (re)spawned this run
+
+    # ── lifecycle ────────────────────────────────────────────────────────────────────
+    def _command(self):
+        cmd = [self.binary, '--serve', '-m', self.backbone,
+               '--audio-decoder-model', self.decoder]
+        if self.clone_ref and self.encoder:
+            cmd += ['--audio-encoder-model', self.encoder, '--reference-audio', self.clone_ref]
+        return cmd
+
+    def start(self):
+        """Spawn the child and wait for its ``{"status":"ready"}`` line. Raises
+        :class:`MossRunAborted` if the binary can't spawn or never reports ready (abort-loud:
+        a missing/broken MOSS must NOT silently fall back to Kokoro)."""
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.proc = self._popen_factory(
+                self._command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=0)
+        except (OSError, FileNotFoundError) as e:
+            raise MossSpawnError(
+                f"Could not spawn the MOSS engine ({self.binary!r}): {e}. "
+                f"Install/patch the OpenMOSS llama.cpp fork, or run with '-b cpu' to use "
+                f"Kokoro instead.") from e
+        self.spawns += 1
+        self._start_stderr_drain()
+        self._wait_ready()
+        return self
+
+    def _start_stderr_drain(self):
+        """Drain the child's stderr (llama logs) on a daemon thread so a full pipe can't
+        deadlock it. Bounded in-memory tail kept only for diagnostics on death."""
+        self._stderr_log = []
+        stderr = getattr(self.proc, 'stderr', None)
+        if stderr is None:
+            return
+
+        def drain():
+            try:
+                for raw in iter(stderr.readline, b''):
+                    line = raw.decode('utf-8', 'replace').rstrip('\n') if isinstance(raw, bytes) else str(raw).rstrip('\n')
+                    self._stderr_log.append(line)
+                    if len(self._stderr_log) > 200:
+                        del self._stderr_log[:100]  # keep a bounded tail
+            except (ValueError, OSError):
+                pass  # stream closed on child exit
+
+        self._stderr_thread = threading.Thread(target=drain, daemon=True)
+        self._stderr_thread.start()
+
+    def _wait_ready(self):
+        deadline = time.time() + self._ready_timeout
+        while True:
+            line = self._read_line(deadline)
+            if line is None:
+                self._kill()
+                raise MossSpawnError(
+                    f"The MOSS engine ({self.binary!r}) spawned but never became ready "
+                    f"(timeout/EOF). {self._stderr_tail()} Run with '-b cpu' to use Kokoro.")
+            msg = self._parse_json(line)
+            if msg is None:
+                continue  # non-JSON stdout noise; the control channel should be clean, ignore
+            if msg.get('status') == 'ready':
+                return
+
+    def _read_line(self, deadline):
+        """Read one stdout line, returning None on EOF or if ``deadline`` passes / child dies.
+
+        Uses a blocking readline on a daemon thread so a wedged child can't block forever; the
+        thread is abandoned (daemon) if it never returns — its line is discarded.
+        """
+        stdout = self.proc.stdout
+        result = {}
+        done = threading.Event()
+
+        def rd():
+            try:
+                result['line'] = stdout.readline()
+            except (ValueError, OSError):
+                result['line'] = b''
+            finally:
+                done.set()
+
+        t = threading.Thread(target=rd, daemon=True)
+        t.start()
+        while not done.wait(timeout=0.1):
+            if time.time() > deadline:
+                return None
+            if self.proc.poll() is not None:
+                # Child exited; give the drain a beat to flush a final line, else EOF.
+                if done.wait(timeout=0.5):
+                    break
+                return None
+        raw = result.get('line', b'')
+        if raw in (b'', ''):
+            return None  # EOF
+        return raw.decode('utf-8', 'replace').rstrip('\n') if isinstance(raw, bytes) else str(raw).rstrip('\n')
+
+    @staticmethod
+    def _parse_json(line):
+        try:
+            msg = json.loads(line)
+            return msg if isinstance(msg, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    def _stderr_tail(self, n=8):
+        tail = (self._stderr_log or [])[-n:]
+        return f"Last child stderr:\n{chr(10).join(tail)}" if tail else "(no child stderr captured)"
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    # ── request/response ─────────────────────────────────────────────────────────────
+    def synth(self, text, timeout):
+        """Issue ONE synth request for ``text`` and block for the response.
+
+        Returns a float32 1-D numpy array @ 24 kHz. Raises :class:`MossError` on a
+        ``status:"error"`` line (child healthy), :class:`MossPermanentError` for deterministic
+        codes (bad_request/empty_audio), and :class:`MossDeath` on EOF / dead poll / timeout.
+        """
+        if not self.alive():
+            raise MossDeath('child not running')
+        self._req_id += 1
+        req_id = self._req_id
+        wav_out = self.work_dir / f'moss-req-{req_id}.wav'
+        wav_out.unlink(missing_ok=True)  # stale-WAV guard: never read a previous request's audio
+        request = {
+            'v': 1, 'id': req_id, 'op': 'synth', 'text': text,
+            'wav_out': str(wav_out), 'seed': MOSS_SEED,
+            'sampling': dict(MOSS_SAMPLING), 'max_new_tokens': MOSS_MAX_NEW_TOKENS,
+        }
+        try:
+            self.proc.stdin.write((json.dumps(request, ensure_ascii=False) + '\n').encode('utf-8'))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise MossDeath(f'broken pipe writing request {req_id}') from e
+
+        deadline = time.time() + timeout
+        while True:
+            line = self._read_line(deadline)
+            if line is None:
+                raise MossDeath(
+                    f'no response to request {req_id} (EOF/timeout/poll). {self._stderr_tail()}')
+            msg = self._parse_json(line)
+            if msg is None or msg.get('id') != req_id:
+                continue  # stray/log line, or a response to an earlier id; keep reading
+            try:
+                return self._handle_response(msg, wav_out)
+            finally:
+                # The handoff WAV is transient (one per sentence) — drop it once read so a
+                # book doesn't leave thousands of req-N.wavs behind. (No-op on an error path
+                # where the child never wrote it.)
+                Path(wav_out).unlink(missing_ok=True)
+
+    def _handle_response(self, msg, wav_out):
+        status = msg.get('status')
+        if status == 'error':
+            code = msg.get('code', 'gen_failed')
+            detail = msg.get('message', '')
+            # Deterministic codes can't be fixed by retrying the same pinned-seed request.
+            if code in ('bad_request', 'empty_audio'):
+                raise MossPermanentError(f'MOSS {code}: {detail}')
+            raise MossError(f'MOSS {code}: {detail}')
+        if status != 'ok':
+            raise MossError(f'unexpected MOSS response status {status!r}')
+        frames = msg.get('frames', 0)
+        if not frames or frames <= 0:
+            # Spec forbids ok-with-zero; treat as permanent so np.zeros(0) is never cached.
+            raise MossPermanentError('MOSS reported ok with no frames')
+        if not Path(wav_out).exists():
+            raise MossError(f'MOSS reported ok but {wav_out} is missing')
+        audio, sr = self._wav_reader(wav_out)
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            raise MossPermanentError('MOSS wav decoded to empty audio')
+        return audio
+
+    # ── teardown ─────────────────────────────────────────────────────────────────────
+    def close(self):
+        """Graceful shutdown ({"op":"shutdown"} then wait), escalating to kill. Idempotent;
+        safe to call from a ``finally`` even if the child already died or never spawned."""
+        proc = self.proc
+        try:
+            if proc is not None and proc.poll() is None and proc.stdin is not None:
+                try:
+                    proc.stdin.write(b'{"op":"shutdown"}\n')
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    self._kill()
+        finally:
+            self.proc = None
+            # Remove the per-instance handoff dir (and any straggler WAVs) so nothing leaks —
+            # even when the child never spawned (start() already created the dir).
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+
+    def _kill(self):
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def restart(self):
+        """Kill (if needed) and re-spawn the child — used by the closure on a death."""
+        self._kill()
+        self.proc = None
+        return self.start()
+
+
+def _build_llamacpp_synth(voice, lang_code, clone_ref=None, gguf_dir=None,
+                          moss_factory=None, work_dir=None, clock=time.time):
+    """Engine closure for the MOSS resident-pipe co-process (engine='llamacpp').
+
+    Returns ``synth(text, speed) -> list[np.ndarray] @ 24 kHz``. MOSS issues ONE pipe request
+    per sentence. ``synth`` honors the batch contract: a ``\\n\\n\\n``-joined ``text`` is split
+    and one request is issued per piece, returning a list aligned per sentence. ``speed`` is
+    IGNORED here — MOSS has no speed knob; speed is applied downstream via ffmpeg atempo at
+    chapter assembly, and the MOSS sentence cache stays speed-agnostic (ADR 0002).
+
+    The closure owns the failure-vs-death policy:
+      * a ``status:"error"`` line -> ``MossError`` propagates to ``_synth_one_or_silence``
+        (dead-letter + silence; child healthy);
+      * a death (EOF / dead poll / timeout) -> restart the child and re-dispatch the SAME
+        sentence; after K=:data:`MOSS_DEATHS_BEFORE_POISON` consecutive deaths raise
+        ``MossPermanentError`` (poison-pill -> dead-letter, ``_retry`` won't re-spin it);
+      * a systemic restart rate (circuit-breaker) raises ``MossRunAborted`` -> whole run aborts.
+    ``moss_factory`` is injectable so tests supply a fake MossProcess (no binary/GPU).
+    """
+    if moss_factory is None:
+        # Resolve the binary + GGUF paths through the SINGLE source of truth (T3's
+        # backends.moss_paths — the same resolution doctor preflights), so the run spawns
+        # exactly what --doctor checked. `gguf_dir` (if given) overrides for tests/odd layouts.
+        if gguf_dir is not None:
+            gd = Path(gguf_dir)
+            binary, backbone = MOSS_BINARY, gd / MOSS_BACKBONE_GGUF
+            decoder, encoder = gd / MOSS_DECODER_GGUF, (gd / MOSS_ENCODER_GGUF if clone_ref else None)
+        else:
+            p = backends.moss_paths()
+            binary = str(p['binary']) if p.get('binary') else MOSS_BINARY
+            backbone, decoder, encoder = p.get('backbone'), p.get('decoder'), p.get('encoder')
+
+        def moss_factory():
+            return MossProcess(binary=binary, backbone=backbone, decoder=decoder, encoder=encoder,
+                               clone_ref=clone_ref, work_dir=work_dir)
+    moss = moss_factory()
+    moss.start()
+
+    # Circuit-breaker: timestamps of recent RESTARTS (an infra death we recovered from). It must
+    # distinguish a systemic STORM (e.g. VRAM exhaustion: many restarts bunched in time) from a
+    # few sparse transient hiccups spread across a long book — so it is RATE-windowed: it trips
+    # only when > MOSS_MAX_RESTARTS_IN_WINDOW restarts fall inside a trailing time window. Poison-
+    # pill deaths are NOT counted here: they're handled locally (dead-letter the sentence), and
+    # counting them would let one bad sentence trip the global breaker and abort the whole book.
+    restart_times = []
+
+    def _note_restart():
+        now = clock()
+        restart_times.append(now)
+        cutoff = now - MOSS_RESTART_WINDOW_SECONDS
+        restart_times[:] = [t for t in restart_times if t >= cutoff]
+        if len(restart_times) > MOSS_MAX_RESTARTS_IN_WINDOW:
+            raise MossCircuitBreakerError(
+                f'MOSS engine restarted {len(restart_times)} times within '
+                f'{MOSS_RESTART_WINDOW_SECONDS:.0f}s — a systemic failure (e.g. VRAM '
+                f'exhaustion mid-book). Aborting to preserve partial chapters + dead-letters; '
+                f"re-run to resume, or use '-b cpu' for Kokoro.")
+
+    def _synth_one(text):
+        """One sentence -> one array, with the death/restart/poison-pill loop.
+
+        ``deaths`` is per-call (reset on success/return); it counts CONSECUTIVE deaths on THIS
+        sentence. K=MOSS_DEATHS_BEFORE_POISON deaths -> poison-pill -> dead-letter (a permanent
+        error _retry won't re-spin). An infra death below K restarts the child and re-dispatches
+        the SAME sentence; only those restarts feed the (rate-windowed) global circuit-breaker.
+        """
+        deadline_s = max(MOSS_RESPONSE_TIMEOUT_FLOOR, len(text) * MOSS_TIMEOUT_SECONDS_PER_CHAR)
+        deaths = 0
+        while True:
+            try:
+                return moss.synth(text, timeout=deadline_s)
+            except MossDeath as death:
+                deaths += 1
+                if deaths >= MOSS_DEATHS_BEFORE_POISON:
+                    # Poison pill: this sentence keeps killing the child. Dead-letter it (raised
+                    # as a permanent error so _retry won't re-spin) instead of crash-looping. The
+                    # child stays dead; restart it so the NEXT sentence has a live engine.
+                    try:
+                        moss.restart()
+                    except MossRunAborted:
+                        raise
+                    except Exception:
+                        pass
+                    raise MossPermanentError(
+                        f'MOSS child died {deaths}x on the same sentence (poison pill); '
+                        f'dead-lettering it.') from death
+                # Infra death (first one): restart and re-dispatch the SAME sentence. The
+                # rate-windowed breaker (in _note_restart) aborts only on a systemic storm.
+                _note_restart()
+                moss.restart()
+
+    def synth(text, speed):
+        pieces = text.split('\n\n\n') if '\n\n\n' in text else [text]
+        return [_synth_one(piece) for piece in pieces]
+
+    synth.close = moss.close   # core.main's finally + the GUI teardown path call this
+    synth.moss = moss          # exposed for tests/diagnostics
     return synth
 
 
@@ -615,15 +1130,43 @@ def _account(stats, n_sentences, chars, elapsed, post_event, chapter_label):
     print('Progress:', f'{stats.progress}%\n')
 
 
-def _cache_key_fields(backend, voice, speed, precision='fp32'):
+def _moss_repo_id():
+    """MOSS ``repo_id`` for the cache key — delegates to the SINGLE source of truth.
+
+    The GGUF-identity derivation lives in :func:`audiblez.backends.moss_repo_id` (T3 owns it;
+    `doctor` consumes it too), so core must NOT re-derive "which GGUFs" or the two definitions
+    drift and the cache serves stale audio after a model swap. The clone reference is NOT in the
+    repo_id here — it enters the cache key on the *voice* axis via
+    :func:`audiblez.backends.clone_voice_id` (see ``_cache_key_fields``).
+    """
+    return backends.moss_repo_id()
+
+
+def _cache_key_fields(backend, voice, speed, precision='fp32', clone_ref=None):
     """Versioned key components that, with the sentence text, address a synth result.
 
     ``precision`` changes the waveform (fp16/bf16 autocast) but ONLY on GPU torch
     backends; it is a no-op on cpu/mlx/mps, so it is normalised to 'fp32' there to
     avoid fragmenting the cache pointlessly. Including it stops a cache populated under
     one precision from serving the wrong waveform on a re-run with another.
+
+    For the MOSS engine ('llamacpp') the key hashes the PINNED seed + the six sampling params
+    (via ``sampling_sig``) and the three GGUF identities (via ``backends.moss_repo_id()`` — the
+    shared source of truth). A voice CLONE reference is folded onto the *voice* axis via
+    ``backends.clone_voice_id`` (the reference WAV *is* the voice) so two different clips never
+    collide on a constant — dropping it would serve the prior clone's audio on a re-run (a banned
+    silent-wrongness). ``engine`` already separates MOSS from Kokoro (no CACHE_VERSION bump for
+    engine separation — ADR 0002). Speed is pinned to 1.0 (MOSS synth@1.0; speed = atempo later),
+    so the sentence cache stays speed-agnostic.
     """
     info = backends.BACKENDS[backend]
+    if info.engine == 'llamacpp':
+        moss_voice = backends.clone_voice_id(clone_ref) if clone_ref else voice
+        return dict(engine='llamacpp', repo_id=backends.moss_repo_id(), voice=moss_voice,
+                    speed=1.0,  # MOSS sentence cache is speed-agnostic (atempo applied later)
+                    precision='fp32', max_sentence_length=MAX_SENTENCE_LENGTH,
+                    spacy_version=spacy.__version__,
+                    seed=MOSS_SEED, sampling_sig=_moss_sampling_sig())
     repo_id = MLX_REPO_ID if info.engine == 'mlx' else TORCH_REPO_ID
     eff_precision = precision if gpu._is_torch_gpu(backend) else 'fp32'
     return dict(engine=info.engine, repo_id=repo_id, voice=voice, speed=speed,
@@ -703,12 +1246,19 @@ def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False
              precision='fp32'):
     load_spacy()
     synth = build_synthesizer(voice, backend, precision=precision)
-    audio_segments = gen_audio_segments(synth, text, voice=voice, speed=speed)
+    try:
+        audio_segments = gen_audio_segments(synth, text, voice=voice, speed=speed)
+    finally:
+        getattr(synth, 'close', lambda: None)()  # close the resident MOSS child (no-op for Kokoro)
     if not audio_segments:
         print('Warning: no audio generated for the given text.')
         return
     final_audio = np.concatenate(audio_segments)
     soundfile.write(output_file, final_audio, sample_rate)
+    # MOSS has no speed knob (synth@1.0); re-stretch to `speed` via atempo so a one-off
+    # gen_text render honors --speed like the chapter path does.
+    if backends.BACKENDS[backend].engine == 'llamacpp':
+        _apply_atempo(output_file, speed)
     if play:
         subprocess.run(['ffplay', '-autoexit', '-nodisp', output_file])
 
@@ -738,28 +1288,35 @@ def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend
     preview_chars = MAX_SENTENCE_LENGTH * (sentences_per_chapter + 1)
 
     pieces, sampled = [], 0
-    for chapter in chapters:
-        if max_chapters and sampled >= max_chapters:
-            break
-        # Only the opening sentences are sampled, so feed a prefix: gen_audio_segments
-        # spaCy-parses ALL of its text before slicing to max_sentences.
-        raw = chapter.extracted_text.strip()[:preview_chars]
-        text = lexicon.apply_lexicon(raw, book_lexicon)
-        if len(text) < 10:
-            continue
-        # Number by the sampled sequence (1..N over included chapters) so spoken labels are
-        # consecutive and match the final m4b's chapter numbering, not the raw list index.
-        pieces.extend(gen_audio_segments(synth, f'Chapter {sampled + 1}.', voice=voice, speed=speed))
-        pieces.append(gap)
-        pieces.extend(gen_audio_segments(synth, text, voice=voice, speed=speed,
-                                         max_sentences=sentences_per_chapter))
-        pieces.append(gap)
-        sampled += 1
+    try:
+        for chapter in chapters:
+            if max_chapters and sampled >= max_chapters:
+                break
+            # Only the opening sentences are sampled, so feed a prefix: gen_audio_segments
+            # spaCy-parses ALL of its text before slicing to max_sentences.
+            raw = chapter.extracted_text.strip()[:preview_chars]
+            text = lexicon.apply_lexicon(raw, book_lexicon)
+            if len(text) < 10:
+                continue
+            # Number by the sampled sequence (1..N over included chapters) so spoken labels are
+            # consecutive and match the final m4b's chapter numbering, not the raw list index.
+            pieces.extend(gen_audio_segments(synth, f'Chapter {sampled + 1}.', voice=voice, speed=speed))
+            pieces.append(gap)
+            pieces.extend(gen_audio_segments(synth, text, voice=voice, speed=speed,
+                                             max_sentences=sentences_per_chapter))
+            pieces.append(gap)
+            sampled += 1
+    finally:
+        getattr(synth, 'close', lambda: None)()  # close the resident MOSS child (no-op for Kokoro)
 
     if not pieces:
         print('No chapters to put in the trailer.')
         return None
     soundfile.write(output_file, np.concatenate(pieces), sample_rate)
+    # MOSS synthesizes at 1.0 (no speed knob); re-stretch the trailer to `speed` once so the
+    # audition matches what the real render will produce (US-26). Kokoro already baked it in.
+    if backends.BACKENDS[backend].engine == 'llamacpp':
+        _apply_atempo(output_file, speed)
     print(f'Trailer written to {output_file} ({sampled} chapter(s) sampled).')
     return output_file
 
@@ -918,6 +1475,44 @@ def _robust_duration(path):
         except Exception:
             duration = None
     return duration
+
+
+def _atempo_filter(speed):
+    """ffmpeg ``atempo`` filter chain for ``speed`` (atempo accepts 0.5–2.0 per stage, so a
+    speed outside that is split into a chain whose product is ``speed``)."""
+    remaining = float(speed)
+    stages = []
+    while remaining > 2.0:
+        stages.append(2.0); remaining /= 2.0
+    while remaining < 0.5:
+        stages.append(0.5); remaining /= 0.5
+    stages.append(remaining)
+    return ','.join(f'atempo={s:.6f}' for s in stages)
+
+
+def _apply_atempo(wav_path, speed):
+    """Re-stretch an already-written chapter wav to ``speed`` in place (pitch-preserving).
+
+    The MOSS engine has no speed knob: it always synthesizes at 1.0, so playback speed is
+    applied here once per chapter via ffmpeg ``atempo`` (ADR 0002) — and the MOSS sentence
+    cache stays speed-agnostic (re-stretch instead of re-synthesize on a speed change). A
+    1.0 speed is a no-op. Requires ffmpeg; without it speed would silently no-op, which is a
+    banned wrongness class, so we raise to surface it (caller decides; cli aborts/​warns).
+    """
+    if abs(float(speed) - 1.0) < 1e-6:
+        return
+    if not shutil.which('ffmpeg'):
+        raise RuntimeError(
+            f'--speed {speed} needs ffmpeg to time-stretch MOSS audio (MOSS has no speed '
+            f'knob), but ffmpeg is not on PATH. Install ffmpeg, or run at speed 1.0.')
+    src = Path(wav_path)
+    tmp = src.with_suffix('.atempo.wav')
+    args = ['ffmpeg', '-y', '-i', str(src), '-filter:a', _atempo_filter(speed), str(tmp)]
+    proc = subprocess.run(args, capture_output=True, text=True)
+    if proc.returncode != 0:
+        Path(tmp).unlink(missing_ok=True)
+        raise RuntimeError(f'ffmpeg atempo failed (exit {proc.returncode}).\n{(proc.stderr or "")[-1000:]}')
+    Path(tmp).replace(src)
 
 
 def is_valid_chapter_wav(path, expected_text_len, max_chars_per_sec=VALIDATION_MAX_CHARS_PER_SEC):

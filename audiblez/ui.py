@@ -54,6 +54,9 @@ class MainWindow(wx.Frame):
 
         self.create_menu()
         self.create_layout()
+        # Close any resident engine (the MOSS child holds VRAM) when the window closes, so it
+        # isn't orphaned past the GUI session.
+        self.Bind(wx.EVT_CLOSE, self.on_window_close)
         self.Centre()
         self.Show(True)
         if Path('../epub/lewis.epub').exists(): self.open_epub('../epub/lewis.epub')
@@ -570,12 +573,24 @@ class MainWindow(wx.Frame):
 
     def _cached_synth(self, core, voice, backend):
         """Reuse the built synthesizer across preview/audition clicks; building one reloads
-        the whole Kokoro model (seconds + GPU memory). Rebuild only when voice/backend change."""
+        the whole Kokoro model (seconds + GPU memory) — for MOSS it spawns a resident child,
+        so the cold start (~2.7s) is paid once per GUI session. Rebuild only when voice/backend
+        change, and tear down the PREVIOUS engine first so a MOSS child isn't orphaned (it
+        holds ~8 GB of VRAM) when the user switches voice/backend."""
         key = (voice, backend)
         if getattr(self, '_synth_cache_key', None) != key:
+            self._close_cached_synth()
             self._synth = core.build_synthesizer(voice, backend)
             self._synth_cache_key = key
         return self._synth
+
+    def _close_cached_synth(self):
+        """Tear down the cached engine (closes the resident MOSS child; no-op for Kokoro)."""
+        synth = getattr(self, '_synth', None)
+        if synth is not None:
+            getattr(synth, 'close', lambda: None)()
+        self._synth = None
+        self._synth_cache_key = None
 
     def _synth_to_temp(self, core, text, voice, speed):
         """Synthesize text to a temp wav and return its path (or None if no audio)."""
@@ -711,6 +726,15 @@ class MainWindow(wx.Frame):
     def on_exit(self, event):
         self.Close()
 
+    def on_window_close(self, event):
+        # Release the cached engine (kills the resident MOSS child + frees its VRAM) before
+        # the window is destroyed, then let the default close handling proceed.
+        try:
+            self._close_cached_synth()
+        except Exception:
+            pass
+        event.Skip()
+
     def set_table_chapter_status(self, chapter_index, status):
         self.table.SetItem(chapter_index, 3, status)
 
@@ -732,10 +756,13 @@ class CoreThread(threading.Thread):
         self.params = params
 
     def run(self):
-        from audiblez.core import main
+        from audiblez.core import main, MossRunAborted
         try:
             main(**self.params, post_event=self.post_event)
-        except Exception as e:
+        # MossRunAborted is a BaseException (so it propagates through core's broad
+        # `except Exception` silence-handlers up to here); catch it explicitly or the GUI
+        # would lock — no error dialog, no re-enabled controls — when MOSS aborts loud.
+        except (Exception, MossRunAborted) as e:
             import traceback
             traceback.print_exc()
             # Capture the message NOW: Python deletes the `except ... as e` binding when

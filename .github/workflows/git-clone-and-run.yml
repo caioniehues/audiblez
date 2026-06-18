@@ -36,6 +36,7 @@ jobs:
           python -m unittest discover -s test -p 'test_validation.py' -v
           python -m unittest discover -s test -p 'test_eta.py' -v
           python -m unittest discover -s test -p 'test_batching.py' -v
+          python -m unittest discover -s test -p 'test_moss.py' -v
           python -m unittest discover -s test -p 'test_resilience.py' -v
           python -m unittest discover -s test -p 'test_trailer.py' -v
           python -m unittest discover -s test -p 'test_lexicon.py' -v
