@@ -54,7 +54,9 @@ class MakeTrailerTest(unittest.TestCase):
         self.assertEqual(gen.call_count, 2)  # only the non-empty chapter
 
     def test_max_chapters_caps_sampling(self):
-        chapters = [_chapter('One.'), _chapter('Two.'), _chapter('Three.')]
+        # texts must clear make_trailer's <10-char skip guard
+        chapters = [_chapter('Chapter one body.'), _chapter('Chapter two body.'),
+                    _chapter('Chapter three body.')]
         p = self._patches()
         with p[0], p[1], p[2], p[3], p[4] as gen, p[5]:
             core.make_trailer('book.epub', 'af_sky', 'trailer.wav',
