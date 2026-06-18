@@ -10,6 +10,8 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v3
+      - name: Lint with ruff
+        run: pip install ruff && ruff check .
       - name: install ffmpeg, espeak-ng
         run: sudo apt-get update && sudo apt-get install ffmpeg espeak-ng --fix-missing
       - name: Install dependencies

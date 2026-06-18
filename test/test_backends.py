@@ -67,11 +67,30 @@ class DetectionTest(unittest.TestCase):
             ('cpu',): 'cpu',
             ('cpu', 'cuda'): 'cuda',
             ('cpu', 'rocm'): 'rocm',
-            ('cpu', 'mps', 'mlx'): 'mps',   # torch MPS preferred over mlx as the safe default
+            ('cpu', 'mps', 'mlx'): 'mlx',   # native MLX preferred over torch MPS (README: fastest on Mac)
         }
         for avail, expected in cases.items():
             with mock.patch.object(backends, 'available_backends', return_value=list(avail)):
                 self.assertEqual(backends.default_backend(), expected)
+
+
+class GpuWorksTest(unittest.TestCase):
+    def test_cpu_and_unknown_backends_are_always_ok(self):
+        self.assertTrue(backends.gpu_works('cpu'))
+        self.assertTrue(backends.gpu_works('bogus'))
+
+    def test_faulting_gpu_returns_false(self):
+        boom = mock.MagicMock()
+        boom.ones.side_effect = RuntimeError('HIP error: no usable kernel')
+        with mock.patch.dict('sys.modules', {'torch': boom}):
+            self.assertFalse(backends.gpu_works('rocm'))  # is_available() lies; kernel faults
+
+    def test_working_gpu_returns_true(self):
+        import numpy as np
+        ok = mock.MagicMock()
+        ok.ones.side_effect = lambda *a, **k: np.ones((8, 8))  # real array supports @/.sum().item()
+        with mock.patch.dict('sys.modules', {'torch': ok}):
+            self.assertTrue(backends.gpu_works('rocm'))
 
 
 if __name__ == '__main__':

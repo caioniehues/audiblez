@@ -149,7 +149,7 @@ A handful of commands help you trust a long run before (and after) committing th
 audiblez --doctor                       # preflight: ffmpeg, espeak-ng, spaCy, backend (add --deep to synth one word)
 audiblez book.epub --trailer            # render trailer.wav: opening lines of each chapter — audition voice + detection
 audiblez book.epub --seed-lexicon       # write book.lexicon.json of names/acronyms to respell; applied next run
-audiblez book.epub --cache              # cache synthesized sentences and reuse them on re-runs/Preview (opt-in)
+audiblez book.epub --cache              # cache synthesized sentences and reuse them on re-runs (CLI; opt-in)
 audiblez book.epub --merge              # rebuild a playable .m4b from chapters already synthesized (crash recovery)
 ```
 
@@ -157,7 +157,8 @@ audiblez book.epub --merge              # rebuild a playable .m4b from chapters 
 - **`--trailer`** lets you hear whether chapter detection, voice, and pronunciation are right in ~2 minutes.
 - **`--seed-lexicon`** seeds a per-book pronunciation sidecar (`<book>.lexicon.json`); edit the values to fix
   recurring names/acronyms once. The GUI has a "📖 Pronunciations" editor and a "🗣️ Audition voice" button.
-- **`--cache`** stores each sentence's audio under `<output>/.audiblez_cache` and reuses it on the next run.
+- **`--cache`** stores each sentence's audio under `<output>/.audiblez_cache` and reuses it on the next run
+  (CLI only; the GUI does not use the cache yet). `--cache-clear` wipes that cache.
 - **`--merge`** stitches the chapter `.wav`s that already exist into an `.m4b`, so an interrupted run still yields
   a playable audiobook.
 
@@ -171,6 +172,7 @@ For all the options available, you can check the help page `audiblez --help`:
 ```
 usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-b {cpu,cuda,rocm,mps,mlx}] [-o FOLDER]
                 [--doctor] [--deep] [--merge] [--trailer] [--seed-lexicon] [--cache]
+                [--cache-clear] [--tune] [--precision {fp32,fp16,bf16}]
                 [epub_file_path]
 
 positional arguments:
@@ -183,14 +185,16 @@ options:
   -s, --speed SPEED     Set speed from 0.5 to 2.0
   -b, --backend {cpu,cuda,rocm,mps,mlx}
                         Narration backend: cpu, cuda (NVIDIA), rocm (AMD), mps
-                        (Apple Silicon), mlx (Apple Silicon native). Default: cpu.
+                        (Apple Silicon), mlx (Apple Silicon native). Default: auto-select
+                        the best working backend (a GPU when usable, else CPU).
   -o, --output FOLDER   Output folder for the audiobook and temporary files
   --doctor              Run preflight checks (ffmpeg, espeak-ng, spaCy, backend) and exit
   --deep                With --doctor: also load the model and synthesize one word (slow)
   --merge               Assemble already-synthesized chapter wavs into an m4b and exit
   --trailer             Render a short trailer.wav sampling the opening of each chapter and exit
   --seed-lexicon        Write a <book>.lexicon.json of candidate names/acronyms to edit, then exit
-  --cache               Cache synthesized sentences and reuse them on re-runs/Preview (opt-in)
+  --cache               Cache synthesized sentences and reuse them on re-runs (opt-in)
+  --cache-clear         Delete the sentence cache under <output>/.audiblez_cache and exit
 
 example:
   audiblez book.epub -v af_sky -b mlx

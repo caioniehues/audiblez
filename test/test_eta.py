@@ -31,13 +31,18 @@ class UpdateEtaTest(unittest.TestCase):
     def _stats(self):
         return SimpleNamespace(total_chars=1000, processed_chars=0, chars_per_sec=50.0)
 
-    def test_one_update_blends_rate_and_sets_fields(self):
+    def test_first_update_replaces_prior_then_blends(self):
         s = self._stats()
-        _update_eta(s, measured_chars=100, elapsed=1.0)  # measured 100 cps
-        self.assertAlmostEqual(s.chars_per_sec, 0.3 * 100 + 0.7 * 50)  # 65
+        _update_eta(s, measured_chars=100, elapsed=1.0)  # first measured sample: 100 cps
+        # The flat 50 prior is only a guess, so the first real measurement REPLACES it
+        # (otherwise a ~10x-off prior would dominate the ETA for the opening chapters).
+        self.assertAlmostEqual(s.chars_per_sec, 100.0)
         self.assertEqual(s.processed_chars, 100)
         self.assertEqual(s.progress, 10)
-        self.assertEqual(s.eta, strfdelta((1000 - 100) / 65.0))
+        self.assertEqual(s.eta, strfdelta((1000 - 100) / 100.0))
+        # A SECOND measurement now blends into the EWMA rather than replacing.
+        _update_eta(s, measured_chars=50, elapsed=1.0)  # 50 cps
+        self.assertAlmostEqual(s.chars_per_sec, 0.3 * 50 + 0.7 * 100)  # 85
 
     def test_converges_to_measured_rate(self):
         s = self._stats()

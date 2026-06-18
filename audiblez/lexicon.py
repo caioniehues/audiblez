@@ -16,8 +16,11 @@ import hashlib
 from pathlib import Path
 from collections import Counter
 
-_ACRONYM_RE = re.compile(r'\b[A-Z]{2,}\b')        # NASA, USB, AI
-_PROPER_RE = re.compile(r'\b[A-Z][a-z]{2,}\b')    # Capitalized words (>=3 chars)
+_ACRONYM_RE = re.compile(r'\b[A-Z]{2,}\b')        # NASA, USB, AI (ASCII acronyms)
+# Any word of >=3 letters (Unicode-aware: \w excludes accents only for [A-Z], so use a
+# letter class). Title-case is then filtered in seed_terms via str.istitle(), which IS
+# Unicode-aware, so accented proper nouns (Muñoz, André, Björn) are seeded too.
+_PROPER_RE = re.compile(r'\b[^\W\d_]{3,}\b')
 
 # Common capitalized sentence-starters / function words to keep out of the seed.
 _STOPWORDS = {
@@ -53,23 +56,33 @@ def save_lexicon(path, mapping):
 
 
 def _active(mapping):
-    """Only the entries that actually change text: non-empty respelling that differs."""
-    return {k: v for k, v in mapping.items() if v and v != k}
+    """Only the entries that actually change text: non-empty key AND non-empty respelling
+    that differs. A blank/whitespace-only key is dropped — left in, ``\\b\\b`` would match
+    at every word boundary and inject the value across the whole chapter."""
+    return {k: v for k, v in mapping.items() if k and k.strip() and v and v != k}
 
 
 def apply_lexicon(text, mapping):
     """Replace each lexicon term (whole word) with its respelling.
 
     Identity and empty entries are no-ops (a freshly seeded lexicon changes nothing until
-    a value is edited). Longer terms are applied first so an overlapping shorter term does
-    not pre-empt a longer one.
+    a value is edited). Replacement is a SINGLE pass over the text via one alternation
+    regex, longest term first, so a shorter term can never re-match inside a longer term's
+    replacement output (the sequential-``re.sub`` corruption: ``AIME``->``AI-me`` then
+    ``AI``->...). Matching is case-sensitive: add case variants (e.g. both ``NASA`` and
+    ``Nasa``) deliberately, since case-insensitive matching would mis-hit words like ``us``
+    for an ``US`` key.
     """
     active = _active(mapping)
     if not active:
         return text
-    for term in sorted(active, key=len, reverse=True):
-        text = re.sub(rf'\b{re.escape(term)}\b', active[term].replace('\\', r'\\'), text)
-    return text
+    # Longest-first in the alternation: regex tries alternatives left-to-right at each
+    # position, so a longer term wins over a shorter prefix at the same spot.
+    terms = sorted(active, key=len, reverse=True)
+    pattern = re.compile(r'\b(?:' + '|'.join(re.escape(t) for t in terms) + r')\b')
+    # Function replacement => the respelling is inserted literally (no \1/\g backslash
+    # interpretation), so no escaping of the value is needed.
+    return pattern.sub(lambda m: active[m.group(0)], text)
 
 
 def seed_terms(text, min_count=2, max_terms=200):
@@ -80,7 +93,9 @@ def seed_terms(text, min_count=2, max_terms=200):
     common function words. Ordered by frequency, capped at ``max_terms``.
     """
     counts = Counter(_ACRONYM_RE.findall(text))
-    counts.update(_PROPER_RE.findall(text))
+    # Keep only title-case words as proper nouns (istitle() is Unicode-aware, so accented
+    # names qualify); this filters lowercase prose the broad letter regex also matches.
+    counts.update(w for w in _PROPER_RE.findall(text) if w.istitle())
     terms = []
     for term, count in counts.most_common():
         if term in _STOPWORDS:

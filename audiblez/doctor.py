@@ -110,7 +110,7 @@ def check_spacy_model(model: str = SPACY_MODEL) -> CheckResult:
         return CheckResult('spaCy', 'fail', 'not installed (pip install spacy)')
     if importlib.util.find_spec(model) is None:
         return CheckResult(f'spaCy model {model}', 'warn',
-                           f'not installed — audiblez will auto-download it on first run')
+                           'not installed — audiblez will auto-download it on first run')
     return CheckResult(f'spaCy model {model}', 'ok', 'installed')
 
 
@@ -140,22 +140,31 @@ def run_checks(backend: str = 'cpu') -> list[CheckResult]:
             check_kokoro(), check_spacy_model(), check_backend(backend)]
 
 
-def deep_check(backend: str = 'cpu', voice: str = 'af_sky') -> CheckResult:
+def deep_check(backend: str = 'cpu', voice: str = 'af_sky', tune: bool = False,
+               output_folder: str = '.', precision: str = 'fp32') -> CheckResult:
     """Slow check: actually build the synthesizer and synth one word.
 
     Loads the full model (seconds), so it is opt-in (``--doctor --deep``) and the
-    only check that imports :mod:`audiblez.core`.
+    only check that imports :mod:`audiblez.core`. Doubles as a **cache warm-up**: the
+    synth compiles & caches GPU conv kernels (MIOpen, ``~/.cache/miopen``) so the
+    first real chapter doesn't pay that stall; with ``tune`` it also seeds the
+    TunableOp results CSV **under output_folder** (the same place the real run reads it,
+    so the warm-up isn't wasted) and exercises the requested ``precision``. Run
+    ``audiblez --doctor --deep --tune -b rocm -o out`` once before a long conversion.
     """
     try:
         import audiblez.core as core
+        from audiblez import gpu
         core.set_espeak_library()
-        synth = core.build_synthesizer(voice, backend)
-        out = synth('Hello.', 1.0)
+        gpu.configure_tunableop(tune, backend, results_dir=output_folder, out=lambda *_: None)
+        synth = core.build_synthesizer(voice, backend, precision=precision)
+        out = synth('Hello, this warms the kernel caches.', 1.0)
         produced = bool(out) and sum(len(seg) for seg in out) > 0
-        return CheckResult('deep: synth one word', 'ok' if produced else 'fail',
-                           'produced audio' if produced else 'synth returned no audio')
+        warmed = 'MIOpen' + (' + TunableOp CSV' if gpu._is_torch_gpu(backend) and tune else '')
+        detail = f'produced audio; warmed {warmed} cache' if produced else 'synth returned no audio'
+        return CheckResult('deep: synth + warm caches', 'ok' if produced else 'fail', detail)
     except Exception as e:  # any failure in the heavy path is a diagnostic, not a crash
-        return CheckResult('deep: synth one word', 'fail', f'{type(e).__name__}: {e}')
+        return CheckResult('deep: synth + warm caches', 'fail', f'{type(e).__name__}: {e}')
 
 
 def format_report(results: list[CheckResult], color: bool = True) -> str:
@@ -169,11 +178,13 @@ def format_report(results: list[CheckResult], color: bool = True) -> str:
 
 
 def run_doctor(backend: str = 'cpu', voice: str = 'af_sky', deep: bool = False,
-               color: bool = True, out=print) -> bool:
+               color: bool = True, out=print, tune: bool = False,
+               output_folder: str = '.', precision: str = 'fp32') -> bool:
     """Run the preflight, print a red/green report, and return True iff nothing failed."""
     results = run_checks(backend)
     if deep:
-        results.append(deep_check(backend, voice))
+        results.append(deep_check(backend, voice, tune=tune, output_folder=output_folder,
+                                  precision=precision))
     out(format_report(results, color=color))
     ok = not any(r.status == 'fail' for r in results)
     summary = 'All required checks passed.' if ok else 'Some required checks FAILED.'

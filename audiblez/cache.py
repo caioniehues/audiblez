@@ -2,8 +2,9 @@
 """Opt-in, per-sentence content-addressed synthesis cache (KEYSTONE slice 1).
 
 This is the deliberately small first slice of the KEYSTONE idea: a **cache only**, with
-NO resume / streaming / correctness claim. Enabled with ``audiblez --cache``, it keys each
-synthesized sentence by a versioned hash and reuses the audio on a re-run or Preview.
+NO resume / streaming / correctness claim. Enabled with ``audiblez --cache`` (CLI only —
+the GUI does not wire the cache yet), it keys each synthesized sentence by a versioned
+hash and reuses the audio on a re-run.
 
 The key (see :func:`make_key`) captures everything that changes the waveform, the lesson
 from the spike: cache version, engine, **model repo_id (which differs by quantization
@@ -16,6 +17,7 @@ synthesis runs per sentence so each cached unit maps 1:1 to a stored array and c
 seams are identical to a per-sentence run. Batching the cache-misses is a documented later
 optimization (findings.md §4). Pure numpy/hashlib/json — no audio model needed to test.
 """
+import os
 import json
 import hashlib
 import numpy as np
@@ -24,14 +26,20 @@ from pathlib import Path
 CACHE_VERSION = 1  # bump to invalidate every entry when the synth contract changes
 
 
-def make_key(engine, repo_id, voice, speed, text, max_sentence_length, spacy_version=''):
-    """Deterministic content-addressed key for one synthesized sentence."""
+def make_key(engine, repo_id, voice, speed, text, max_sentence_length, spacy_version='',
+             precision='fp32'):
+    """Deterministic content-addressed key for one synthesized sentence.
+
+    ``precision`` is part of the key because fp16/bf16 autocast changes the waveform;
+    omitting it would let a cache populated under one precision serve another's audio.
+    """
     payload = json.dumps({
         'v': CACHE_VERSION,
         'engine': engine,
         'repo_id': repo_id,
         'voice': voice,
         'speed': round(float(speed), 4),
+        'precision': precision,
         'msl': max_sentence_length,
         'spacy': spacy_version,
         'text': text,
@@ -59,17 +67,39 @@ class SynthCache:
                 audio = np.load(path)
                 self.hits += 1
                 return audio
-            except Exception:
-                pass  # corrupt entry -> treat as a miss and let the caller resynthesize
+            except (ValueError, OSError, EOFError) as e:
+                # Corrupt/truncated entry (e.g. an interrupted write): drop it so it is
+                # regenerated cleanly next run instead of failing np.load forever.
+                print(f'Warning: discarding corrupt cache entry {path.name}: {e}')
+                path.unlink(missing_ok=True)
         self.misses += 1
         return None
 
     def put(self, key, audio):
-        """Persist an audio array under ``key`` (best-effort; cache failures never abort a run)."""
+        """Persist an audio array under ``key`` (best-effort; cache failures never abort a run).
+
+        Writes to a unique temp file then atomically renames, so a crash mid-write can
+        never leave a half-written ``.npy`` that a later run would read as valid.
+        """
+        path = self._path(key)
+        tmp = path.with_suffix(f'.{os.getpid()}.tmp.npy')
         try:
-            np.save(self._path(key), np.asarray(audio))
-        except OSError as e:
+            np.save(tmp, np.asarray(audio))
+            os.replace(tmp, path)
+        except Exception as e:  # disk full, bad array, etc. — never abort the run
             print(f'Warning: could not write cache entry: {e}')
+            Path(tmp).unlink(missing_ok=True)
+
+    def clear(self):
+        """Delete every cached entry. Returns the number of files removed."""
+        removed = 0
+        for f in self.dir.glob('*.npy'):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
 
     def stats(self):
         total = self.hits + self.misses

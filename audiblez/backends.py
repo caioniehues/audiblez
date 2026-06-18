@@ -58,12 +58,36 @@ def available_backends() -> list[str]:
 
 
 def default_backend() -> str:
-    """Best available backend: prefer an accelerator, fall back to CPU."""
+    """Best available backend: prefer an accelerator, fall back to CPU.
+
+    On Apple Silicon, prefer the native 'mlx' engine over torch 'mps' (mlx is the faster
+    Apple path per the README), so a bare invocation auto-selects the recommended backend.
+    """
     avail = available_backends()
-    for pref in ('cuda', 'rocm', 'mps', 'mlx', 'cpu'):
+    for pref in ('cuda', 'rocm', 'mlx', 'mps', 'cpu'):
         if pref in avail:
             return pref
     return 'cpu'
+
+
+def gpu_works(backend: str) -> bool:
+    """Whether a torch GPU backend can actually run a kernel — not just ``is_available()``.
+
+    Catches the gfx-mismatch case (e.g. RDNA3 without the right HSA_OVERRIDE_GFX_VERSION)
+    where ``torch.cuda.is_available()`` is True but the first real op faults at the HIP
+    level. Returns True for non-GPU / non-torch backends (nothing to probe). Used to make
+    the auto-selected backend fall back to CPU instead of crashing/emitting silence.
+    """
+    info = BACKENDS.get(backend)
+    if info is None or info.engine != 'torch' or info.torch_device in (None, 'cpu'):
+        return True
+    try:
+        import torch
+        x = torch.ones(8, 8, device=info.torch_device)
+        float((x @ x).sum().item())  # force execution + device sync
+        return True
+    except Exception:
+        return False
 
 
 def is_gpu(backend: str) -> bool:

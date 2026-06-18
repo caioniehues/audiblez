@@ -24,10 +24,17 @@ from ebooklib import epub
 from pick import pick
 
 from audiblez import backends
+from audiblez import gpu
 from audiblez import lexicon
 
 sample_rate = 24000
 _nlp = None  # cached spaCy pipeline (loaded once, reused across chapters/previews)
+_espeak_registered = False  # set once; every synth entry point registers espeak idempotently
+
+# Model weights, defined once so the synth builders and the cache key can never drift
+# (a one-sided edit would otherwise make --cache serve audio from the wrong model).
+TORCH_REPO_ID = 'hexgrad/Kokoro-82M'           # torch backends (cpu/cuda/rocm/mps)
+MLX_REPO_ID = 'mlx-community/Kokoro-82M-bf16'   # Apple-Silicon-native (quantized) weights
 
 MAX_SENTENCE_LENGTH = 400  # chars; Kokoro truncates long non-English sentences, so we split them
 GPU_CHARS_PER_SEC = 500    # rough synthesis throughput, used only for the ETA display
@@ -47,6 +54,10 @@ HEARTBEAT_EVERY = 10   # emit a progress heartbeat line every N synthesized sent
 BATCH_MAX_CHARS = 1000
 
 SYNTH_RETRIES = 2                     # extra attempts after the first before giving up on a unit
+SYNTH_RETRY_BACKOFF = 0.5             # seconds between retries, so a transient fault (e.g. OOM) can clear
+# Deterministic errors that retrying cannot fix (bad input / code bug): fail fast to silence
+# instead of re-running the same losing call N times (and amplifying it across a batch).
+_PERMANENT_SYNTH_ERRORS = (ValueError, TypeError, KeyError, AttributeError, IndexError)
 FALLBACK_SILENCE_CHARS_PER_SEC = 15   # gap length (proportional to text) for a dead-lettered sentence
 
 TRAILER_SENTENCES_PER_CHAPTER = 2     # opening sentences sampled per chapter in --trailer
@@ -83,19 +94,29 @@ def load_spacy():
     return _nlp
 
 
-def set_espeak_library():
+def set_espeak_library(library=None):
     """Locate the espeak-ng library and register it with phonemizer.
 
     Fails LOUD: the path resolution (delegated to :func:`audiblez.doctor.find_espeak_library`)
     raises a ``RuntimeError`` with an actionable, OS-specific install hint instead of the
     old swallow-and-continue, which used to let a run proceed for an hour and emit nothing.
     Run ``audiblez --doctor`` to check this ahead of a long synthesis.
+
+    Idempotent: the first call registers; later calls (e.g. from :func:`build_synthesizer`
+    on the trailer / audition paths) are no-ops, so registration happens exactly once per
+    process. ``library`` lets a caller pass an already-resolved path (e.g. the one the
+    preflight just found) so the espeak library isn't globbed for twice.
     """
-    from audiblez.doctor import find_espeak_library
-    library = find_espeak_library()
+    global _espeak_registered
+    if _espeak_registered:
+        return
+    if library is None:
+        from audiblez.doctor import find_espeak_library
+        library = find_espeak_library()
     print('Using espeak library:', library)
     from phonemizer.backend.espeak.wrapper import EspeakWrapper
     EspeakWrapper.set_library(library)
+    _espeak_registered = True
 
 
 def extract_book_metadata(book):
@@ -110,7 +131,7 @@ def extract_book_metadata(book):
 def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_folder: str = '.',
          max_chapters: int | None = None, max_sentences: int | None = None,
          selected_chapters: list | None = None, backend: str = 'cpu', post_event=None,
-         cache_dir: str | None = None) -> None:
+         cache_dir: str | None = None, tune: bool = False, precision: str = 'fp32') -> int:
     if post_event: post_event('CORE_STARTED')
     # Fast preflight: abort in seconds with an actionable message rather than dying
     # 40 minutes in on a missing dep. See `audiblez --doctor` for the same checks.
@@ -144,7 +165,7 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     if cache_dir:
         from audiblez import cache as cache_mod
         synth_cache = cache_mod.SynthCache(cache_dir)
-        cache_fields = _cache_key_fields(backend, voice, speed)
+        cache_fields = _cache_key_fields(backend, voice, speed, precision)
         print(f'Sentence cache enabled at {cache_dir}')
 
     document_chapters = find_document_chapters_and_extract_texts(book)
@@ -173,29 +194,38 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
     print('Total words:', len(' '.join(texts).split()))
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
-    set_espeak_library()
-    synth = build_synthesizer(voice, backend)
+    # Reuse the path the preflight already resolved so espeak isn't globbed for twice.
+    espeak_lib = next((c.detail for c in checks if c.name == 'espeak-ng' and c.status == 'ok'), None)
+    set_espeak_library(espeak_lib)
+    # GPU GEMM autotuning must be configured before the first synth (TunableOp caches
+    # its env on first read); persist the results CSV under the output folder.
+    gpu.configure_tunableop(tune, backend, results_dir=output_folder)
+    synth = build_synthesizer(voice, backend, precision=precision)
 
     chapter_wav_files = []
     intro_added = False
+    total_failures = 0  # dead-lettered sentences across the whole book (degraded-run signal)
+    render_signature = _render_signature(book_lexicon, speed, precision)
     for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
-        xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-        chapter_wav_path = Path(output_folder) / f'{Path(filename).stem}_chapter_{i}_{voice}_{xhtml_file_name}.wav'
+        chapter_wav_path = Path(output_folder) / _chapter_wav_name(
+            Path(filename).stem, i, voice, chapter.get_name())
         chapter_wav_files.append(chapter_wav_path)
         if Path(chapter_wav_path).exists():
             # Only skip if the existing wav is actually usable — a truncated/zero-byte
             # file from a prior crash must be regenerated, not reused into the m4b.
             expected_len = None if max_sentences else len(text)
-            if is_valid_chapter_wav(chapter_wav_path, expected_len):
+            if (is_valid_chapter_wav(chapter_wav_path, expected_len)
+                    and _chapter_is_complete(chapter_wav_path, render_signature)):
                 print(f'File for chapter {i} already exists. Skipping')
                 stats.processed_chars += len(text)
                 if post_event:
                     post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
                 continue
-            print(f'Existing file for chapter {i} is invalid/truncated; regenerating.')
+            print(f'Existing file for chapter {i} is invalid, incomplete, or stale; regenerating.')
             Path(chapter_wav_path).unlink(missing_ok=True)
+            Path(chapter_wav_path).with_suffix('.sig').unlink(missing_ok=True)
         if len(text.strip()) < 10:
             print(f'Skipping empty chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
@@ -219,10 +249,18 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
+            # Record the render signature so a later run regenerates this chapter if the
+            # lexicon/speed/precision changed (see _chapter_is_complete).
+            Path(chapter_wav_path).with_suffix('.sig').write_text(render_signature, encoding='utf-8')
             end_time = time.time()
             delta_seconds = end_time - start_time
             chars_per_sec = len(text) / delta_seconds
             print('Chapter written to', chapter_wav_path)
+            chapter_failures = _count_dead_letters(dead_letter_path)
+            total_failures += chapter_failures
+            if chapter_failures:
+                print(f'\033[91m⚠ Chapter {i}: {chapter_failures} sentence(s) failed and were '
+                      f'replaced with silence (see {dead_letter_path}). Re-run to retry them.\033[0m')
             if post_event: post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
             print(f'Chapter {i} read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
         else:
@@ -239,9 +277,17 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         valid_wavs = [w for w in chapter_wav_files if is_valid_chapter_wav(w, None)]
         if valid_wavs:
             create_m4b(valid_wavs, filename, cover_image, output_folder, title=title, creator=creator)
-            if post_event: post_event('CORE_FINISHED')
         else:
             print('No valid chapter audio to assemble into an m4b.')
+
+    if total_failures:
+        print(f'\033[91m⚠ {total_failures} sentence(s) failed across the book and were replaced '
+              f'with silence; the audiobook has gaps. See the .failed.jsonl files, and re-run to '
+              f'retry them (affected chapters regenerate automatically).\033[0m')
+    # Always signal completion so the GUI re-enables its controls even when nothing was
+    # assembled (all chapters empty/invalid, or ffmpeg missing) — otherwise the UI locks.
+    if post_event: post_event('CORE_FINISHED')
+    return total_failures
 
 
 def find_cover(book):
@@ -291,15 +337,22 @@ def split_long_sentence(text, max_length=MAX_SENTENCE_LENGTH):
     return parts
 
 
-def build_synthesizer(voice: str, backend: str = 'cpu'):
+def build_synthesizer(voice: str, backend: str = 'cpu', precision: str = 'fp32'):
     """Return ``synth(text, speed) -> list[np.ndarray]`` (float32 @ 24000 Hz).
 
     Torch backends (cpu/cuda/rocm/mps) set the process-global default device and build
     a Kokoro KPipeline; the mlx backend loads the Apple-Silicon-native Kokoro model.
     Both engines emit identical-format audio, so everything downstream is engine-agnostic.
+
+    ``precision`` ('fp32' | 'fp16' | 'bf16') wraps the torch synth call in autocast for
+    GPU throughput; it is a no-op on cpu/mlx/mps (see :mod:`audiblez.gpu`). Lower
+    precision changes the waveform, so it is opt-in and should be auditioned.
     """
     if backend not in backends.BACKENDS:
         raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
+    # Register espeak here too (idempotent), so every synth entry point — main, the trailer,
+    # and the GUI audition/preview — has phonemization wired before the first synth call.
+    set_espeak_library()
     info = backends.BACKENDS[backend]
     lang_code = voice[0]
     if info.engine == 'mlx':
@@ -311,11 +364,14 @@ def build_synthesizer(voice: str, backend: str = 'cpu'):
     # torch path (cpu/cuda/rocm/mps): KPipeline's device= does a proper model .to(device),
     # which (unlike a global torch.set_default_device) actually works on MPS and avoids
     # mutating process-wide torch state.
-    pipeline = KPipeline(lang_code=lang_code, repo_id='hexgrad/Kokoro-82M', device=info.torch_device)
+    pipeline = KPipeline(lang_code=lang_code, repo_id=TORCH_REPO_ID, device=info.torch_device)
 
     def synth(text, speed):
-        return [to_numpy(audio)
-                for _gs, _ps, audio in pipeline(text, voice=voice, speed=speed, split_pattern=r'\n\n\n')]
+        # autocast must stay active while the generator runs the model forwards, so the
+        # comprehension is consumed inside the context (nullcontext when precision=fp32).
+        with gpu.autocast_context(backend, precision):
+            return [to_numpy(audio)
+                    for _gs, _ps, audio in pipeline(text, voice=voice, speed=speed, split_pattern=r'\n\n\n')]
     return synth
 
 
@@ -326,7 +382,7 @@ def _build_mlx_synth(voice: str, lang_code: str):
     not require it on non-Apple platforms.
     """
     from mlx_audio.tts.utils import load_model  # optional dep; only when mlx is selected
-    model = load_model('mlx-community/Kokoro-82M-bf16')
+    model = load_model(MLX_REPO_ID)
 
     def synth(text, speed):
         return [np.asarray(seg.audio).reshape(-1)
@@ -347,10 +403,18 @@ def ewma(prev, sample, alpha=EWMA_ALPHA):
 
 
 def _update_eta(stats, measured_chars, elapsed):
-    """Fold one measurement into stats: rolling chars/sec, progress %, and ETA string."""
+    """Fold one measurement into stats: rolling chars/sec, progress %, and ETA string.
+
+    The FIRST real measurement REPLACES the flat GPU/CPU_CHARS_PER_SEC prior outright
+    (the prior is only a pre-run guess); subsequent measurements blend into the EWMA.
+    Otherwise the prior — often ~10x off the true rate — would dominate the ETA for the
+    first ~15 batches.
+    """
     stats.processed_chars += measured_chars
     if elapsed and elapsed > 0:
-        stats.chars_per_sec = ewma(getattr(stats, 'chars_per_sec', None), measured_chars / elapsed)
+        sample = measured_chars / elapsed
+        stats.chars_per_sec = ewma(stats.chars_per_sec, sample) if getattr(stats, 'measured', False) else sample
+        stats.measured = True
     stats.progress = min(100, stats.processed_chars * 100 // stats.total_chars) if stats.total_chars else 100
     remaining_chars = max(0, stats.total_chars - stats.processed_chars)  # intro chars can overshoot
     stats.eta = strfdelta(remaining_chars / (stats.chars_per_sec or 1))
@@ -382,14 +446,25 @@ def _silence_for(text):
     return np.zeros(int(seconds * sample_rate), dtype=np.float32)
 
 
-def _retry(fn, retries):
-    """Call ``fn`` up to ``retries + 1`` times (at least once); return it or re-raise the last error."""
+def _retry(fn, retries, backoff=SYNTH_RETRY_BACKOFF):
+    """Call ``fn`` up to ``retries + 1`` times (at least once); return it or re-raise.
+
+    A deterministic error (:data:`_PERMANENT_SYNTH_ERRORS` — bad input / code bug) is
+    re-raised immediately, since retrying the identical call cannot help and only wastes
+    work (badly so inside a batch). Transient errors back off between attempts so a fault
+    that needs a moment to clear (e.g. a GPU OOM still holding memory) gets one.
+    """
     last = RuntimeError('no attempts made')
-    for _ in range(max(1, retries + 1)):
+    attempts = max(1, retries + 1)
+    for i in range(attempts):
         try:
             return fn()
+        except _PERMANENT_SYNTH_ERRORS:
+            raise
         except Exception as e:
             last = e
+            if backoff and i < attempts - 1:
+                time.sleep(backoff)
     raise last
 
 
@@ -403,27 +478,54 @@ def _record_dead_letter(path, chapter_label, text, error):
         print(f'Warning: could not write dead-letter entry to {path}: {e}')
 
 
-def _synth_batch(synth, batch, speed, retries=SYNTH_RETRIES, chapter_label=None, dead_letter_path=None):
+def _count_dead_letters(path):
+    """Number of failed-sentence records in a chapter's dead-letter file (0 if absent)."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    try:
+        return sum(1 for line in p.read_text(encoding='utf-8').splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
+def _synth_one_or_silence(synth, sentence, speed, retries, chapter_label, dead_letter_path):
+    """Synth one sentence with bounded retries; on persistent failure splice silence.
+
+    Returns ``(segments, failed)``: the synthesized segment list (or ``[silence]`` on
+    failure, with the sentence recorded to the dead-letter file). Shared by the batched
+    and cached paths so their retry/silence/dead-letter behavior can never diverge.
+    """
+    try:
+        return _retry(lambda: synth(sentence, speed), retries), False
+    except Exception as e:
+        print(f'\033[91mSentence failed after {retries + 1} attempts; inserting silence.\033[0m')
+        if dead_letter_path:
+            _record_dead_letter(dead_letter_path, chapter_label, sentence, str(e))
+        return [_silence_for(sentence)], True
+
+
+def _synth_batch(synth, batch, speed, retries=SYNTH_RETRIES, chapter_label=None,
+                 dead_letter_path=None, on_fallback=None):
     """Synthesize a batch of sentences, never raising for a single bad sentence.
 
     Tries the whole batch in one call (with bounded retries). On persistent failure it
     falls back to per-sentence synthesis; any sentence that still fails after its retries
     is replaced with silence and recorded to a dead-letter file, so one bad sentence (or
     a failed batched call) degrades to a gap instead of nuking the entire chapter.
+    ``on_fallback`` (if given) is called once when the batch path fails — the caller uses
+    it to keep that batch's inflated wall time out of the throughput EWMA.
     """
     try:
         return _retry(lambda: synth('\n\n\n'.join(batch), speed), retries)
     except Exception as e:
         print(f'\033[91mBatch synth failed ({e}); retrying sentence-by-sentence.\033[0m')
+        if on_fallback:
+            on_fallback()
     segments = []
     for s in batch:
-        try:
-            segments.extend(_retry(lambda s=s: synth(s, speed), retries))
-        except Exception as e:
-            print(f'\033[91mSentence failed after {retries + 1} attempts; inserting silence.\033[0m')
-            segments.append(_silence_for(s))
-            if dead_letter_path:
-                _record_dead_letter(dead_letter_path, chapter_label, s, str(e))
+        segs, _ = _synth_one_or_silence(synth, s, speed, retries, chapter_label, dead_letter_path)
+        segments.extend(segs)
     return segments
 
 
@@ -438,7 +540,9 @@ def _account(stats, n_sentences, chars, elapsed, post_event, chapter_label):
     before = getattr(stats, 'sentences_done', 0)
     _update_eta(stats, chars, elapsed)
     stats.sentences_done = before + n_sentences
-    if post_event: post_event('CORE_PROGRESS', stats=stats)
+    # Snapshot the scalar fields: the worker keeps mutating `stats`, so passing it live
+    # lets the GUI thread read a torn mix of fields from different updates.
+    if post_event: post_event('CORE_PROGRESS', stats=SimpleNamespace(**vars(stats)))
     if stats.sentences_done // HEARTBEAT_EVERY > before // HEARTBEAT_EVERY:
         where = f' [{chapter_label}]' if chapter_label else ''
         print(f'♥ heartbeat{where}: {stats.sentences_done} sentences, '
@@ -447,12 +551,20 @@ def _account(stats, n_sentences, chars, elapsed, post_event, chapter_label):
     print('Progress:', f'{stats.progress}%\n')
 
 
-def _cache_key_fields(backend, voice, speed):
-    """Versioned key components that, with the sentence text, address a synth result."""
+def _cache_key_fields(backend, voice, speed, precision='fp32'):
+    """Versioned key components that, with the sentence text, address a synth result.
+
+    ``precision`` changes the waveform (fp16/bf16 autocast) but ONLY on GPU torch
+    backends; it is a no-op on cpu/mlx/mps, so it is normalised to 'fp32' there to
+    avoid fragmenting the cache pointlessly. Including it stops a cache populated under
+    one precision from serving the wrong waveform on a re-run with another.
+    """
     info = backends.BACKENDS[backend]
-    repo_id = 'mlx-community/Kokoro-82M-bf16' if info.engine == 'mlx' else 'hexgrad/Kokoro-82M'
+    repo_id = MLX_REPO_ID if info.engine == 'mlx' else TORCH_REPO_ID
+    eff_precision = precision if gpu._is_torch_gpu(backend) else 'fp32'
     return dict(engine=info.engine, repo_id=repo_id, voice=voice, speed=speed,
-                max_sentence_length=MAX_SENTENCE_LENGTH, spacy_version=spacy.__version__)
+                precision=eff_precision, max_sentence_length=MAX_SENTENCE_LENGTH,
+                spacy_version=spacy.__version__)
 
 
 def _split_into_sentences(doc, lang_code):
@@ -492,15 +604,13 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
                 _account(stats, 1, len(sent), 0.0, post_event, chapter_label)
                 continue
             t0 = time.time()
-            try:
-                segs = _retry(lambda s=sent: synth(s, speed), synth_retries)
-                audio = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+            segs, failed = _synth_one_or_silence(synth, sent, speed, synth_retries,
+                                                 chapter_label, dead_letter_path)
+            audio = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+            # Never persist a failure OR an empty result: caching np.zeros(0) would serve
+            # silent "no audio" for that sentence on every future run, hiding the failure.
+            if not failed and audio.size > 0:
                 cache.put(key, audio)
-            except Exception as e:
-                print(f'\033[91mSentence failed after {synth_retries + 1} attempts; inserting silence.\033[0m')
-                audio = _silence_for(sent)  # not cached — never persist a failure
-                if dead_letter_path:
-                    _record_dead_letter(dead_letter_path, chapter_label, sent, str(e))
             audio_segments.append(audio)
             _account(stats, 1, len(sent), time.time() - t0, post_event, chapter_label)
         return audio_segments
@@ -509,17 +619,22 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
         t0 = time.time()
         # Kokoro re-splits on \n\n\n, yielding one audio segment per sentence, in order.
         # Bounded retries + per-sentence fallback so a bad sentence becomes a gap, not a crash.
+        fell_back = []
         audio_segments.extend(_synth_batch(synth, batch, speed, retries=synth_retries,
                                            chapter_label=chapter_label,
-                                           dead_letter_path=dead_letter_path))
-        _account(stats, len(batch), sum(len(s) for s in batch), time.time() - t0,
-                 post_event, chapter_label)
+                                           dead_letter_path=dead_letter_path,
+                                           on_fallback=lambda fb=fell_back: fb.append(1)))
+        # A fallback batch spends wall time on retries while producing little real audio;
+        # don't let that pollute the measured chars/sec (elapsed=0 advances progress only).
+        elapsed = 0.0 if fell_back else (time.time() - t0)
+        _account(stats, len(batch), sum(len(s) for s in batch), elapsed, post_event, chapter_label)
     return audio_segments
 
 
-def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False, backend='cpu'):
+def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False, backend='cpu',
+             precision='fp32'):
     load_spacy()
-    synth = build_synthesizer(voice, backend)
+    synth = build_synthesizer(voice, backend, precision=precision)
     audio_segments = gen_audio_segments(synth, text, voice=voice, speed=speed)
     if not audio_segments:
         print('Warning: no audio generated for the given text.')
@@ -532,7 +647,7 @@ def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False
 
 def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend='cpu',
                  sentences_per_chapter=TRAILER_SENTENCES_PER_CHAPTER, selected_chapters=None,
-                 max_chapters=None):
+                 max_chapters=None, precision='fp32', output_folder='.'):
     """Render a short audio sampler of a book: the opening sentences of each chapter.
 
     For each detected chapter, speaks a "Chapter N" label then its first
@@ -542,21 +657,31 @@ def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend
     misdetected chapter. Modeled on :func:`gen_text`; returns the output path (or None).
     """
     load_spacy()
-    book = epub.read_epub(file_path)
-    document_chapters = find_document_chapters_and_extract_texts(book)
-    chapters = selected_chapters or find_good_chapters(document_chapters)
-    synth = build_synthesizer(voice, backend)
+    # Only parse the epub when chapters weren't supplied (the GUI already has them) —
+    # re-reading + extracting a whole book just to discard it is a multi-second waste.
+    if selected_chapters:
+        chapters = selected_chapters
+    else:
+        chapters = find_good_chapters(find_document_chapters_and_extract_texts(epub.read_epub(file_path)))
+    synth = build_synthesizer(voice, backend, precision=precision)
     gap = np.zeros(int(TRAILER_GAP_SECONDS * sample_rate), dtype=np.float32)
-    book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder='.'))
+    # Same scope as seeding and the real run, so the trailer auditions the SAME pronunciations.
+    book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder))
+    preview_chars = MAX_SENTENCE_LENGTH * (sentences_per_chapter + 1)
 
     pieces, sampled = [], 0
-    for n, chapter in enumerate(chapters, start=1):
+    for chapter in chapters:
         if max_chapters and sampled >= max_chapters:
             break
-        text = lexicon.apply_lexicon(chapter.extracted_text.strip(), book_lexicon)
+        # Only the opening sentences are sampled, so feed a prefix: gen_audio_segments
+        # spaCy-parses ALL of its text before slicing to max_sentences.
+        raw = chapter.extracted_text.strip()[:preview_chars]
+        text = lexicon.apply_lexicon(raw, book_lexicon)
         if len(text) < 10:
             continue
-        pieces.extend(gen_audio_segments(synth, f'Chapter {n}.', voice=voice, speed=speed))
+        # Number by the sampled sequence (1..N over included chapters) so spoken labels are
+        # consecutive and match the final m4b's chapter numbering, not the raw list index.
+        pieces.extend(gen_audio_segments(synth, f'Chapter {sampled + 1}.', voice=voice, speed=speed))
         pieces.append(gap)
         pieces.extend(gen_audio_segments(synth, text, voice=voice, speed=speed,
                                          max_sentences=sentences_per_chapter))
@@ -648,9 +773,11 @@ def _escape_concat_path(path):
 
     ffmpeg's concat demuxer wraps each entry as ``file '<path>'``; a literal single
     quote inside the path must be written as ``'\\''`` (close quote, escaped quote,
-    reopen quote), otherwise paths containing apostrophes break the parse.
+    reopen quote), otherwise paths containing apostrophes break the parse. The demuxer is
+    line-oriented, so any CR/LF is stripped too: a newline would otherwise split one
+    ``file '...'`` entry across lines and let a crafted epub inject a concat directive.
     """
-    return str(path).replace("'", "'\\''")
+    return str(path).replace('\r', '').replace('\n', '').replace("'", "'\\''")
 
 
 def _escape_ffmetadata(value):
@@ -679,7 +806,53 @@ def probe_duration(file_name):
         return None
 
 
-def is_valid_chapter_wav(path, expected_text_len, min_chars_per_sec=VALIDATION_MAX_CHARS_PER_SEC):
+def _render_signature(book_lexicon, speed, precision):
+    """Compact fingerprint of render-affecting inputs NOT already in the chapter filename.
+
+    The wav filename encodes book stem, chapter index, and voice; this captures the rest
+    (active lexicon, speed, precision). Stored next to each chapter wav as a ``.sig`` so
+    that editing the lexicon (or changing speed/precision) invalidates the existing wav on
+    the resume-by-skip path instead of silently reusing audio from the old settings.
+    """
+    return (f'lex={lexicon.fingerprint(book_lexicon)}'
+            f';speed={round(float(speed), 4)};precision={precision}')
+
+
+def _chapter_is_complete(wav_path, render_signature):
+    """Whether an existing chapter wav is a complete, current render safe to skip.
+
+    False when (a) sentences were dead-lettered (a non-empty ``.failed.jsonl`` sibling) —
+    so a re-run retries them instead of shipping the silence forever — or (b) a recorded
+    ``.sig`` disagrees with the current render signature. A missing ``.sig`` (a wav from
+    before this guard) falls back to the validity check alone for backward compatibility.
+    """
+    if _count_dead_letters(Path(wav_path).with_suffix('.failed.jsonl')) > 0:
+        return False
+    sig_path = Path(wav_path).with_suffix('.sig')
+    if sig_path.exists():
+        try:
+            return sig_path.read_text(encoding='utf-8').strip() == render_signature
+        except OSError:
+            return False
+    return True
+
+
+def _robust_duration(path):
+    """Audio duration in seconds via ffprobe, falling back to the wav header (soundfile).
+
+    soundfile reads the duration from the file header with no external process, so this
+    still returns a real value when ffprobe is absent — which is why chapter markers must
+    use it rather than ``probe_duration(...) or 0.0`` (that zeroes every marker)."""
+    duration = probe_duration(path)
+    if duration is None:
+        try:
+            duration = soundfile.info(str(path)).duration
+        except Exception:
+            duration = None
+    return duration
+
+
+def is_valid_chapter_wav(path, expected_text_len, max_chars_per_sec=VALIDATION_MAX_CHARS_PER_SEC):
     """Whether an existing chapter wav is safe to reuse instead of regenerating.
 
     Guards the resume-by-skip path against truncated or zero-byte wavs left behind by
@@ -695,13 +868,7 @@ def is_valid_chapter_wav(path, expected_text_len, min_chars_per_sec=VALIDATION_M
     if not p.exists() or p.stat().st_size == 0:
         return False
 
-    duration = probe_duration(p)
-    if duration is None:  # ffprobe missing/failed -> read the wav header directly
-        try:
-            duration = soundfile.info(str(p)).duration
-        except Exception:
-            duration = None
-
+    duration = _robust_duration(p)  # ffprobe, then the wav header
     if duration is None:
         # Can't measure duration at all: accept any file too big to be a bare header.
         return p.stat().st_size > 1024
@@ -709,7 +876,9 @@ def is_valid_chapter_wav(path, expected_text_len, min_chars_per_sec=VALIDATION_M
         return False
     if expected_text_len is None:
         return True  # length not comparable; readable + non-empty is enough
-    expected_min_sec = expected_text_len / min_chars_per_sec
+    # max_chars_per_sec is the fastest plausible narration; text/that is the MINIMUM
+    # duration a complete chapter could have, halved for generous slack.
+    expected_min_sec = expected_text_len / max_chars_per_sec
     return duration >= expected_min_sec * 0.5
 
 
@@ -721,15 +890,22 @@ def create_index_file(title, creator, chapter_files, output_folder):
     Returns the path to the written file.
     """
     chapters_txt_path = Path(output_folder) / "chapters.txt"
+    # Use a robust duration (ffprobe -> wav header) so markers aren't all collapsed to
+    # START=END=0 when ffprobe is absent. If any chapter is genuinely unmeasurable, omit
+    # the markers entirely (a book with no chapter nav beats one where every marker is 0:00).
+    durations = [_robust_duration(c) for c in chapter_files]
     with open(chapters_txt_path, "w", encoding="utf-8") as f:
         f.write(f";FFMETADATA1\ntitle={_escape_ffmetadata(title)}\n"
                 f"artist={_escape_ffmetadata(creator)}\n\n")
-        start = 0
-        for i, c in enumerate(chapter_files, start=1):
-            duration = probe_duration(c) or 0.0
-            end = start + int(duration * 1000)
-            f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle=Chapter {i}\n\n")
-            start = end
+        if any(d is None for d in durations):
+            print('\033[93mWarning: could not measure some chapter durations '
+                  '(install ffprobe); writing the m4b without chapter markers.\033[0m')
+        else:
+            start = 0
+            for i, duration in enumerate(durations, start=1):
+                end = start + int((duration or 0.0) * 1000)  # all non-None here (guarded above)
+                f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle=Chapter {i}\n\n")
+                start = end
     return chapters_txt_path
 
 
@@ -789,10 +965,22 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, title='', cr
                 Path(tmp).unlink(missing_ok=True)
 
 
+def _chapter_wav_name(stem, index, voice, xhtml_name):
+    """Build a chapter wav filename: ``<stem>_chapter_<i>_<voice>_<xhtml>.wav``.
+
+    Control chars, path separators, and spaces in the epub-derived name are replaced with
+    ``_`` — a newline would otherwise survive into the ffmpeg concat list and let a crafted
+    epub inject a directive. The reader :func:`find_chapter_wavs` matches this exact scheme,
+    so the two are intentionally co-located and must change together.
+    """
+    safe = re.sub(r'[\x00-\x1f/\\ ]', '_', xhtml_name)
+    return f'{stem}_chapter_{index}_{voice}_{safe}.wav'
+
+
 def find_chapter_wavs(file_path, voice, output_folder='.'):
     """Return existing chapter wavs for a book/voice, ordered by chapter index.
 
-    Matches the naming scheme used by :func:`main`
+    Matches the naming scheme built by :func:`_chapter_wav_name`
     (``<stem>_chapter_<i>_<voice>_<xhtml>.wav``) and sorts on the integer ``<i>`` so
     the merge order is the synthesis order, not lexicographic (chapter_10 after 9).
     """

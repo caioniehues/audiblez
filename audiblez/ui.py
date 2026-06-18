@@ -491,7 +491,7 @@ class MainWindow(wx.Frame):
             table.Append(['', chapter.short_name, f"{len(chapter.extracted_text):,}"])
             if auto_selected: table.CheckItem(i)
 
-        title_text = wx.StaticText(panel, label=f"Select chapters to include in the audiobook:")
+        title_text = wx.StaticText(panel, label="Select chapters to include in the audiobook:")
         sizer.Add(title_text, 0, wx.ALL, 5)
         sizer.Add(table, 1, wx.ALL | wx.EXPAND, 5)
         return panel
@@ -539,9 +539,18 @@ class MainWindow(wx.Frame):
         thread.start()
         self.preview_threads.append(thread)
 
+    def _cached_synth(self, core, voice, backend):
+        """Reuse the built synthesizer across preview/audition clicks; building one reloads
+        the whole Kokoro model (seconds + GPU memory). Rebuild only when voice/backend change."""
+        key = (voice, backend)
+        if getattr(self, '_synth_cache_key', None) != key:
+            self._synth = core.build_synthesizer(voice, backend)
+            self._synth_cache_key = key
+        return self._synth
+
     def _synth_to_temp(self, core, text, voice, speed):
         """Synthesize text to a temp wav and return its path (or None if no audio)."""
-        synth = core.build_synthesizer(voice, getattr(self, 'selected_backend', 'cpu'))
+        synth = self._cached_synth(core, voice, getattr(self, 'selected_backend', 'cpu'))
         core.load_spacy()
         audio_segments = core.gen_audio_segments(synth, text, voice=voice, speed=speed)
         if not audio_segments:
@@ -578,13 +587,16 @@ class MainWindow(wx.Frame):
         voice, speed = self.get_selected_voice(), self.get_selected_speed()
         backend = getattr(self, 'selected_backend', 'cpu')
         selected = [c for c in self.document_chapters if getattr(c, 'is_selected', False)] or None
+        # Read on the UI thread; pass the SAME folder the lexicon editor saves to, so the
+        # trailer auditions this book's edited pronunciations (not an empty cwd lexicon).
+        output_folder = self.output_folder_text_ctrl.GetValue()
 
         def produce(core):
             import tempfile
             fd, name = tempfile.mkstemp(suffix='.wav')
             os.close(fd)
             result = core.make_trailer(file_path, voice, name, speed=speed, backend=backend,
-                                       selected_chapters=selected)
+                                       selected_chapters=selected, output_folder=output_folder)
             if not result:
                 try:
                     os.unlink(name)
@@ -602,9 +614,11 @@ class MainWindow(wx.Frame):
         path = lexicon.lexicon_path(self.selected_file_path, self.output_folder_text_ctrl.GetValue())
         current = lexicon.load_lexicon(path)
         if not current:
-            # Seed candidates from the book so the editor isn't empty on first open.
-            book_text = '\n'.join(c.extracted_text for c in getattr(self, 'document_chapters', []))
-            current = lexicon.build_seed_lexicon(book_text)
+            # Seed candidates from the book so the editor isn't empty on first open. This
+            # regexes the whole book, so show a busy cursor while it scans a large novel.
+            with wx.BusyCursor():
+                book_text = '\n'.join(c.extracted_text for c in getattr(self, 'document_chapters', []))
+                current = lexicon.build_seed_lexicon(book_text)
 
         dialog = wx.Dialog(self, title='Pronunciation Lexicon', size=(520, 540))
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -695,13 +709,17 @@ class CoreThread(threading.Thread):
         except Exception as e:
             import traceback
             traceback.print_exc()
+            # Capture the message NOW: Python deletes the `except ... as e` binding when
+            # the block exits, but show_error runs later via CallAfter (it would NameError
+            # on `e`). error_msg is a normal local, so the closure can use it safely.
+            error_msg = str(e)
 
             def show_error():
                 win = wx.GetApp().GetTopWindow()
                 win.synthesis_in_progress = False
                 win.start_button.Enable()
                 win.params_panel.Enable()
-                wx.MessageBox(f"Audiobook generation failed:\n{e}", "Audiblez Error")
+                wx.MessageBox(f"Audiobook generation failed:\n{error_msg}", "Audiblez Error")
 
             wx.CallAfter(show_error)
 

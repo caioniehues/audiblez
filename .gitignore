@@ -10,6 +10,15 @@ chapters.txt
 *.sh
 *.json
 *.onnx
+*.npy
+*.csv
+*.log
+*.sig
+*.failed.jsonl
+.audiblez_cache/
+test/e2e_out/
 dist
 .venv
+.direnv
+.envrc
 *.m4b

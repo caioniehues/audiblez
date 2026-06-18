@@ -91,5 +91,58 @@ class FindChapterWavsTest(unittest.TestCase):
                                      'book_chapter_10_af_sky_end.wav'])
 
 
+@unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
+class RetryClassificationTest(unittest.TestCase):
+    def test_permanent_error_is_not_retried(self):
+        fn = mock.MagicMock(side_effect=ValueError('bad input'))
+        with self.assertRaises(ValueError):
+            core._retry(fn, retries=3, backoff=0)
+        self.assertEqual(fn.call_count, 1)  # deterministic error -> no wasted retries
+
+    def test_transient_error_is_retried(self):
+        fn = mock.MagicMock(side_effect=[RuntimeError('blip'), 'ok'])
+        self.assertEqual(core._retry(fn, retries=2, backoff=0), 'ok')
+        self.assertEqual(fn.call_count, 2)
+
+
+@unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
+class DeadLetterCountTest(unittest.TestCase):
+    def test_counts_nonblank_lines(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'c.failed.jsonl'
+            self.assertEqual(core._count_dead_letters(p), 0)  # absent -> 0
+            p.write_text('{"a": 1}\n\n{"b": 2}\n')
+            self.assertEqual(core._count_dead_letters(p), 2)  # blank line ignored
+
+
+@unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
+class MergeChaptersTest(unittest.TestCase):
+    def _book_patches(self):
+        return (mock.patch.object(core, 'epub'),
+                mock.patch.object(core, 'find_cover', return_value=None),
+                mock.patch.object(core, 'extract_book_metadata', return_value=('T', 'A')))
+
+    def test_no_ffmpeg_returns_none(self):
+        with mock.patch.object(core.shutil, 'which', return_value=None):
+            self.assertIsNone(core.merge_chapters('book.epub', 'af_sky', '.'))
+
+    def test_no_valid_wavs_returns_none(self):
+        a, b, c = self._book_patches()
+        with mock.patch.object(core.shutil, 'which', return_value='/usr/bin/ffmpeg'), a, b, c, \
+             mock.patch.object(core, 'find_chapter_wavs', return_value=[]), \
+             mock.patch.object(core, 'create_m4b') as m4b:
+            self.assertIsNone(core.merge_chapters('book.epub', 'af_sky', '.'))
+            m4b.assert_not_called()
+
+    def test_happy_path_calls_create_m4b(self):
+        a, b, c = self._book_patches()
+        with mock.patch.object(core.shutil, 'which', return_value='/usr/bin/ffmpeg'), a, b, c, \
+             mock.patch.object(core, 'find_chapter_wavs', return_value=[Path('a.wav')]), \
+             mock.patch.object(core, 'is_valid_chapter_wav', return_value=True), \
+             mock.patch.object(core, 'create_m4b', return_value=Path('book.m4b')) as m4b:
+            self.assertEqual(core.merge_chapters('book.epub', 'af_sky', '.'), Path('book.m4b'))
+            m4b.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

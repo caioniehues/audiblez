@@ -58,6 +58,7 @@ audiblez-ui = "audiblez.ui:main"
 
 [tool.poetry.group.dev.dependencies]
 deptry = "^0.23.0"
+ruff = "^0.15.0"
 
 [tool.deptry.per_rule_ignores]
 # lxml is used via BeautifulSoup(features='lxml') (not imported by name);
@@ -66,3 +67,20 @@ DEP002 = ["lxml", "misaki"]
 # phonemizer (provided by phonemizer-fork) is supplied by the kokoro/misaki TTS
 # stack and imported under a guarded try/except in set_espeak_library.
 DEP003 = ["phonemizer"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# High-signal only: real bugs (F), pycodestyle basics (E/W), bugbear (B). We deliberately
+# do NOT enable import-sorting (I) or pyupgrade (UP) — they'd churn this upstream-fork code
+# for no correctness gain. Run: `ruff check` (lint) / `ruff check --fix` (autofix).
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E501",           # long lines are common here; not worth the reflow churn
+    "E701", "E702",   # one-line `if cond: stmt` is a deliberate style in this codebase
+    "E731",           # a few intentional `name = lambda ...` assignments
+    "E741",           # single-char loop var in the upstream voices loop
+    "B905",           # zip(..., strict=) — adding it changes behavior; low value here
+]
