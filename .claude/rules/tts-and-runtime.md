@@ -9,11 +9,13 @@ filter the user never asked for.
 **Runtime reality (measured on-box):**
 - **eager-PyTorch-on-ROCm is the bottleneck.** Quality models run ~9–125× slower than Kokoro and
   slower than real-time (StyleTTS2, CosyVoice2, VoxCPM2, Fish-Speech).
-- **The one fast AMD path is llama.cpp Vulkan (RADV)** with GGUF models. MOSS-TTS-8B
-  (`MossTTSDelay`) on it is the current speed+quality winner; Orpheus-3B also runs this way.
-- **Kokoro-82M** is fast and top-tier on blind naturalness, but flat in affect. No PyTorch-ROCm
-  lever speeds it: fp16/bf16 are flat (bf16 breaks the audio), TunableOp flat, torch.compile flat/
-  crashes on gfx1101. Don't chase them.
+- **The one fast AMD path is llama.cpp Vulkan (RADV)** with GGUF models. **MOSS-TTS-8B
+  (`MossTTSDelay`) is the chosen quality DEFAULT** — integrated as a resident pipe co-process; see
+  `BUILD_ORDER.md` + `docs/adr/0001-0003`. Orpheus-3B also runs this way.
+- **Kokoro-82M** is fast and top-tier on blind *leaderboards*, but flat in affect — and the user
+  A/B'd by ear (2026-06-18) and judged it **sounds bad vs MOSS**, so it is demoted to the **fast
+  fallback** (`docs/adr/0003`). No PyTorch-ROCm lever speeds it: fp16/bf16 are flat (bf16 breaks the
+  audio), TunableOp flat, torch.compile flat/crashes on gfx1101. Don't chase them.
 - Dead ends on this Linux box: ONNX-Runtime ROCm EP (removed), DirectML (Windows-only), sherpa-onnx
   (no AMD provider). `HSA_OVERRIDE_GFX_VERSION` is not needed here — leave it unset.
 

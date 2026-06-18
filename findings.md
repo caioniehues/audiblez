@@ -594,6 +594,14 @@ quality models (StyleTTS2/CosyVoice2), which are more op-heavy but also have dyn
 > Hunt: a TTS that is (a) more natural than Kokoro in BLIND tests, (b) genuinely AMD-accelerated on
 > THIS Linux/ROCm box, (c) permissively licensed. Adversarial verify on all three. Result is sobering.
 
+> **[OVERRULED 2026-06-18 — user listening test]** The user A/B'd `ab_out/moss.wav` vs
+> `ab_out/kokoro.wav` and judged **Kokoro sounds bad, MOSS sounds good**. This resolves the
+> open question the docs explicitly deferred to the user's ear (TTS_MODELS_COMPARISON.md:62,
+> findings.md:410). The blind-leaderboard "#1-tier naturalness" claim below (point 1, and the
+> "Honest reframe" section) is **superseded for this project**: MOSS is the quality default,
+> Kokoro the fast fallback. See `docs/adr/0003-moss-default-engine.md`. The AMD-runtime
+> conclusions (points 2-3, the Orpheus/MOSS llama.cpp-Vulkan path) still stand.
+
 ### The hard truth (verifiers refuted most optimism)
 1. **Kokoro is actually #1-tier on BLIND naturalness.** TTS-Arena V2 / Artificial-Analysis 2026:
    Kokoro-82M v1.0 ELO ~1056-1067, ~54% blind win-rate — top of the OPEN-weight models. Models that
