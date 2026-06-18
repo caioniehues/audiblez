@@ -174,6 +174,16 @@ class MossDiscoveryTest(unittest.TestCase):
             # all-absent still yields a deterministic id (basename:absent triples)
             self.assertEqual(backends.moss_repo_id(), backends.moss_repo_id())
 
+    def test_sampling_sig_deterministic_and_override_sensitive(self):
+        # The canonical default signature is stable run-to-run, includes all six params, and
+        # changes when any one is overridden (so it can never silently drop a sampling change).
+        base = backends.moss_sampling_sig()
+        self.assertEqual(base, backends.moss_sampling_sig())
+        self.assertEqual(base.count('='), 6)
+        self.assertNotEqual(base, backends.moss_sampling_sig({'audio_top_p': 0.9}))
+        # passing the pinned defaults explicitly equals passing nothing (order-independent)
+        self.assertEqual(base, backends.moss_sampling_sig(dict(backends.MOSS_SAMPLING_DEFAULTS)))
+
 
 if __name__ == '__main__':
     unittest.main()

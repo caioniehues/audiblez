@@ -107,6 +107,35 @@ def moss_repo_id() -> str:
     return f'moss-gguf:{digest}'
 
 
+# The six MOSS sampling parameters, PINNED to fixed defaults (spec "REQUEST" line) so the
+# sentence cache actually hits across runs. Changing any value here changes the waveform, so
+# it flows into the cache key via moss_sampling_sig(). Order is fixed for a stable signature.
+MOSS_SAMPLING_DEFAULTS = {
+    'text_temperature': 1.5,
+    'text_top_k': 50,
+    'audio_temperature': 1.7,
+    'audio_top_p': 0.8,
+    'audio_top_k': 25,
+    'audio_repetition_penalty': 1.0,
+}
+
+
+def moss_sampling_sig(sampling: dict | None = None) -> str:
+    """Canonical fingerprint of the MOSS sampling params for the cache key (single source).
+
+    ``core`` passes the result straight into :func:`audiblez.cache.make_key` as
+    ``sampling_sig`` and the same dict into the resident-pipe ``synth`` request, so the cached
+    audio and the synthesized audio can never disagree on sampling. Defaults to
+    :data:`MOSS_SAMPLING_DEFAULTS`; pass a dict to override individual values (merged onto the
+    defaults). Deterministic, sorted, value-typed — exposing it here keeps every call-site on
+    one format instead of each hand-rolling a string.
+    """
+    merged = dict(MOSS_SAMPLING_DEFAULTS)
+    if sampling:
+        merged.update(sampling)
+    return ';'.join(f'{k}={merged[k]}' for k in sorted(merged))
+
+
 def moss_status() -> str:
     """Three-state availability of the MOSS engine, WITHOUT spawning it.
 
