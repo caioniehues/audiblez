@@ -133,6 +133,41 @@ class MossKeyTest(unittest.TestCase):
 
 
 @unittest.skipIf(_CORE_ERR is not None, f"audiblez.core unavailable: {_CORE_ERR}")
+class MossVoiceSentinelTest(unittest.TestCase):
+    """core._cache_key_fields under MOSS with no clone ref (slice 2 / #8).
+
+    The GUI greys the Kokoro voice dropdown under MOSS but it still holds *some* voice string;
+    MOSS ignores it, so the sentence-cache key must be the fixed MOSS_DEFAULT_VOICE sentinel —
+    independent of the dropdown — else the cache fragments by an inert voice and re-runs miss.
+    A clone reference still takes precedence on the voice axis (re-confirmed here).
+    """
+
+    def test_no_clone_uses_sentinel_independent_of_kokoro_voice(self):
+        f1 = core._cache_key_fields('moss', 'af_sky', 1.0)
+        f2 = core._cache_key_fields('moss', 'am_adam', 1.0)
+        self.assertEqual(f1['voice'], core.MOSS_DEFAULT_VOICE)
+        self.assertEqual(f2['voice'], core.MOSS_DEFAULT_VOICE)
+        # whole key (text + fields) is identical across two different Kokoro voices -> a re-run hits
+        self.assertEqual(cache.make_key(text='hi', **f1), cache.make_key(text='hi', **f2))
+
+    def test_clone_ref_overrides_the_sentinel_and_two_refs_differ(self):
+        with TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / 'a.wav', Path(tmp) / 'b.wav'
+            a.write_bytes(b'AAAA'); b.write_bytes(b'BBBB')
+            fa = core._cache_key_fields('moss', 'af_sky', 1.0, clone_ref=str(a))
+            fb = core._cache_key_fields('moss', 'af_sky', 1.0, clone_ref=str(b))
+            self.assertNotEqual(fa['voice'], core.MOSS_DEFAULT_VOICE)  # clone wins over the sentinel
+            self.assertNotEqual(fa['voice'], fb['voice'])              # two refs never collide
+            # same ref -> same voice id (a re-run of the same clone hits)
+            self.assertEqual(fa['voice'], core._cache_key_fields('moss', 'af_sky', 1.0,
+                                                                 clone_ref=str(a))['voice'])
+
+    def test_kokoro_voice_is_not_sentinelled(self):
+        # The sentinel is MOSS-only; a torch backend must keep passing the real voice through.
+        self.assertEqual(core._cache_key_fields('cpu', 'af_sky', 1.0)['voice'], 'af_sky')
+
+
+@unittest.skipIf(_CORE_ERR is not None, f"audiblez.core unavailable: {_CORE_ERR}")
 class RenderSignatureTest(unittest.TestCase):
     """The chapter `.sig` resume gate (core._render_signature) — runs BEFORE the sentence cache,
     so it must capture every MOSS waveform axis too, or a model/sampling/clone swap reuses a stale
@@ -164,6 +199,21 @@ class RenderSignatureTest(unittest.TestCase):
             sig_b = core._render_signature({}, 1.0, 'fp32', backend='moss', clone_ref=str(b))
             self.assertNotEqual(sig_a, none)
             self.assertNotEqual(sig_a, sig_b)
+
+    def test_coarse_changes_moss_signature(self):
+        # Coarse synthesizes a chunk as one utterance -> materially different audio, so a
+        # coarse/per-sentence toggle MUST bust the chapter wav on resume (story 11). The default
+        # (per-sentence) MOSS sig carries no 'coarse' marker, so old .sig files stay valid.
+        plain = core._render_signature({}, 1.0, 'fp32', backend='moss')
+        coarse = core._render_signature({}, 1.0, 'fp32', backend='moss', coarse=True)
+        self.assertNotIn('coarse', plain)
+        self.assertIn('coarse=1', coarse)
+        self.assertNotEqual(plain, coarse)
+
+    def test_coarse_flag_does_not_affect_kokoro_signature(self):
+        # Coarse is MOSS-only; a torch backend's sig is unchanged by the flag (backward compat).
+        self.assertEqual(core._render_signature({}, 1.0, 'fp32', backend='cpu'),
+                         core._render_signature({}, 1.0, 'fp32', backend='cpu', coarse=True))
 
 
 class SynthCacheTest(unittest.TestCase):

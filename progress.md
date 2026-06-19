@@ -202,3 +202,35 @@ parallel agent (independent files). Phases 24–35 in task_plan.md.
 - **tools/ (agent):** `--make-ref`→ref_voice.wav (stops biasing the A/B); MOSS RTF comparability bracket + 0.0-clamp guard; vram caveat; self-consistent RTF; WER normalization (space-split + 0-99 number folding).
 
 ### NOT committed — working tree only (awaiting user go-ahead to commit).
+
+---
+
+## Session — MOSS GUI epic + coarse mode (issues #2, #5, #6, #7, #8, #9) — 2026-06-19
+
+Implemented all 6 open GitHub issues (MOSS-into-GUI epic + Phase-2 backend remainder).
+
+| Issue | What landed | Verification |
+|------|-------------|--------------|
+| #7 | `backends.engine_choices()` (ordered engines + availability + reason from `moss_paths`); GUI renders disabled "MOSS (unavailable — …)" radio | 5 hermetic tests in test_backends.py |
+| #8 | `core.MOSS_DEFAULT_VOICE` sentinel on the MOSS-no-clone cache voice axis; GUI greys voice dropdown + "loading model" busy state under MOSS | updated test_synth.py + 3 tests in test_cache.py |
+| #9 | GUI Clone-reference control (file dialog + clear + WAV header validation + encoder-absent gating); clone_ref threaded into audition (`_cached_synth` key), render (CoreThread), trailer + `make_trailer`/cli parity | clone_ref parity grep clean; ui imports + handlers present |
+| #6 | wired prebuilt `--serve` binary via `AUDIBLEZ_MOSS_BIN` in .envrc (binary already built at ~/Projects/llama.cpp-moss/build-vulkan/bin) | moss_status()=='present'; --doctor OK; 1-sentence synth = 3.68s audio |
+| #2 | coarse-chunk mode now WIRED (was unwired stub): `gen_audio_segments(coarse=)` → `chunking.pack_chunks` @ 16.32s cap, per-chunk cache/failure unit, MOSS-gated in main; coarse folded into chapter `.sig` so a coarse↔per-sentence toggle busts resume (story 11); CLI help updated | 4 synth-path tests in test_batching.py + 2 `.sig` tests in test_cache.py; real-binary smoke = 1 request/chunk, 6.32s audio |
+| #5 | PRD umbrella — satisfied by #6/#7/#8/#9 | — |
+
+**Tests:** full suite 313 → **327 pass, 10 skipped**; ruff clean.
+
+**GUI control wiring verified on the live display (18/18 programmatic checks):** MOSS radio present+enabled;
+voice dropdown greys under MOSS + re-enables on switch-back; clone control shows/hides; WAV validation
+accepts a real wav + rejects a non-wav; clone_ref threads through under MOSS + is suppressed for Kokoro.
+
+**Committed:** branch `feat/moss-gui-integration`, commit `1017fcf` (9 files: backends/cli/core/ui + 4 test
+files + progress.md). NOT pushed; no PR. `.envrc` MOSS wiring is gitignored (local-only — re-add after a
+fresh clone). Pre-existing `tools/tts_ab.py` edit + untracked `CROSS_PROJECT_ANALYSIS.md` /
+`test/MOSS_TEST_AUDIT.md` left untouched (not part of this work).
+
+**Docs:** README "Choosing a backend" gained a MOSS row + a "MOSS — the higher-quality engine" subsection
+(install, `--clone-ref`, `--coarse`, GUI clone control); `--help` block updated for `-b moss` / `--clone-ref` / `--coarse`.
+
+**Still human-gated (irreducible):** by-ear AUDIO quality (does the MOSS/cloned voice sound right; coarse WER)
+— no display or automation can judge perception. 22s coarse cap stays gated on an on-box WER check (16.32s is the validated default).

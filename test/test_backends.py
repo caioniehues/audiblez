@@ -211,5 +211,61 @@ class MossDiscoveryTest(unittest.TestCase):
         self.assertEqual(base, backends.moss_sampling_sig(dict(backends.MOSS_SAMPLING_DEFAULTS)))
 
 
+class EngineChoicesTest(unittest.TestCase):
+    """engine_choices() — the GUI's availability-aware engine list (PRD slice 1 / #7)."""
+
+    _PATHS_PRESENT = {'binary': '/x/llama-moss-tts', 'backbone': '/x/b.gguf',
+                      'decoder': '/x/d.gguf', 'encoder': '/x/e.gguf'}
+
+    def _choices(self, avail, paths=None):
+        with mock.patch.object(backends, 'available_backends', return_value=list(avail)), \
+             mock.patch.object(backends, 'moss_paths', return_value=dict(paths or {})):
+            return backends.engine_choices()
+
+    def test_present_moss_is_available_no_reason(self):
+        # MOSS in available_backends() -> selectable, empty reason, appears in display order.
+        choices = self._choices(['cpu', 'rocm', 'moss'], self._PATHS_PRESENT)
+        by_id = {c.id: c for c in choices}
+        self.assertEqual([c.id for c in choices], ['cpu', 'rocm', 'moss'])
+        self.assertTrue(by_id['moss'].available)
+        self.assertEqual(by_id['moss'].reason, '')
+
+    def test_kokoro_backends_always_available_and_ordered(self):
+        # The torch/mlx backends are always returned available=True in available_backends order.
+        choices = self._choices(['cpu', 'rocm'], {'binary': None, 'backbone': '/x/b.gguf',
+                                                  'decoder': '/x/d.gguf', 'encoder': None})
+        kokoro = [c for c in choices if c.id != 'moss']
+        self.assertEqual([c.id for c in kokoro], ['cpu', 'rocm'])
+        self.assertTrue(all(c.available and c.reason == '' for c in kokoro))
+
+    def test_partial_missing_binary_disabled_with_reason(self):
+        # binary absent, required GGUFs present -> MOSS present-but-disabled, reason names binary.
+        choices = self._choices(['cpu', 'rocm'], {'binary': None, 'backbone': '/x/b.gguf',
+                                                  'decoder': '/x/d.gguf', 'encoder': '/x/e.gguf'})
+        moss = next(c for c in choices if c.id == 'moss')
+        self.assertFalse(moss.available)
+        self.assertIn('binary', moss.reason)
+        self.assertNotIn('model', moss.reason)
+
+    def test_partial_missing_model_disabled_with_reason(self):
+        # binary present, a required GGUF absent -> disabled, reason names model (not binary).
+        choices = self._choices(['cpu', 'rocm'], {'binary': '/x/llama-moss-tts', 'backbone': None,
+                                                  'decoder': '/x/d.gguf', 'encoder': '/x/e.gguf'})
+        moss = next(c for c in choices if c.id == 'moss')
+        self.assertFalse(moss.available)
+        self.assertIn('model', moss.reason)
+        self.assertNotIn('binary', moss.reason)
+
+    def test_absent_moss_disabled_with_nonempty_reason(self):
+        # nothing installed -> still listed (present-but-disabled), reason non-empty (not hidden).
+        choices = self._choices(['cpu'], {'binary': None, 'backbone': None,
+                                          'decoder': None, 'encoder': None})
+        moss = next(c for c in choices if c.id == 'moss')
+        self.assertFalse(moss.available)
+        self.assertTrue(moss.reason)
+        self.assertIn('binary', moss.reason)
+        self.assertIn('model', moss.reason)
+
+
 if __name__ == '__main__':
     unittest.main()
