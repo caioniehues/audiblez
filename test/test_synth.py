@@ -24,6 +24,14 @@ except Exception as e:  # heavy deps (torch/kokoro/...) may be absent
 
 @unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")
 class BuildSynthesizerTest(unittest.TestCase):
+    def setUp(self):
+        # build_synthesizer() registers the espeak-ng library via set_espeak_library(), whose
+        # lookup raises on any host without espeak installed (e.g. CI Windows). These tests
+        # exercise the Kokoro pipeline wiring, not espeak — stub it out, as _drive_main does.
+        p = mock.patch.object(core, 'set_espeak_library')
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_torch_path_passes_device_and_returns_numpy(self):
         fake_audio = np.zeros(4, dtype=np.float32)
         fake_pipeline = mock.MagicMock(return_value=[('g', 'p', fake_audio)])
@@ -608,12 +616,15 @@ class MossCacheFieldsTest(unittest.TestCase):
         # produce different cache fields, else a re-run serves the prior clone's audio.
         info = backends.BackendInfo('moss', 'MOSS', 'llamacpp', None)
         with mock.patch.dict(core.backends.BACKENDS, {'moss': info}):
-            with tempfile.NamedTemporaryFile(suffix='.wav') as a, \
-                 tempfile.NamedTemporaryFile(suffix='.wav') as b:
-                a.write(b'AAAA'); a.flush()
-                b.write(b'BBBB'); b.flush()
-                fa = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=a.name)
-                fb = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=b.name)
+            # Write + close before clone_voice_id reopens by path: Windows forbids a second
+            # open of a still-open NamedTemporaryFile (PermissionError). Matches test_backends.
+            with tempfile.TemporaryDirectory() as d:
+                a = Path(d) / 'a.wav'
+                b = Path(d) / 'b.wav'
+                a.write_bytes(b'AAAA')
+                b.write_bytes(b'BBBB')
+                fa = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=str(a))
+                fb = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=str(b))
                 ftext = core._cache_key_fields('moss', 'af_voice', 1.0)
         self.assertNotEqual(fa['voice'], fb['voice'])   # different clip -> different voice id
         # No clone ref -> the fixed MOSS_DEFAULT_VOICE sentinel, NOT the inert Kokoro voice spec
