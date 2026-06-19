@@ -413,7 +413,10 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
             Path(chapter_wav_path).with_suffix('.sig').write_text(render_signature, encoding='utf-8')
             end_time = time.time()
             delta_seconds = end_time - start_time
-            chars_per_sec = len(text) / delta_seconds
+            # Guard /0: a chapter can finish within the clock's resolution (delta == 0.0) on
+            # coarse-timer platforms (e.g. Windows) or with an instant/cached synth — a crash
+            # here would abort the whole run over a vanity stat.
+            chars_per_sec = len(text) / delta_seconds if delta_seconds > 0 else 0.0
             print('Chapter written to', chapter_wav_path)
             chapter_failures = _count_dead_letters(dead_letter_path)
             total_failures += chapter_failures
