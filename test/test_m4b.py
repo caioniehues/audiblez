@@ -119,7 +119,11 @@ class ChapterFilenameSanitizationTest(unittest.TestCase):
             get_name=lambda: 'chapter/1\ninjected')
 
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(core, 'load_spacy'), \
+            # Stub preflight: hermetic, so no real ffmpeg/espeak-ng (absent on CI Windows);
+            # run_checks() would abort main() before the sanitization logic under test.
+            from audiblez import doctor as _doctor
+            with mock.patch.object(_doctor, 'run_checks', return_value=[]), \
+                 mock.patch.object(core, 'load_spacy'), \
                  mock.patch.object(core, 'epub') as ep, \
                  mock.patch.object(core, 'extract_book_metadata', return_value=('T', 'A')), \
                  mock.patch.object(core, 'find_cover', return_value=None), \

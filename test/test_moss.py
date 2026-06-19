@@ -44,6 +44,13 @@ Symbols used from T2 (audiblez.core) — RECONCILED against the real implementat
 All tests guard the import so they SKIP (not ERROR) if the symbols are absent.
 """
 
+# PEP 563: make ALL annotations lazy strings so a `-> FakeMossProcess` /
+# `: FakeMossAdapter` annotation on a skipIf'd class never evaluates at import.
+# Without this, the guarded `from test._moss_fakes import ...` failing under CI's
+# `discover -s test` invocation leaves those names undefined, and the eager
+# annotation eval crashes module import with NameError (ERROR, not SKIP).
+from __future__ import annotations
+
 import os
 import struct
 import tempfile
