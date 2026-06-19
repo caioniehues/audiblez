@@ -101,7 +101,11 @@ def _drive_main(d, chapters, voice='af_heart', shutil_which=None, post_event=Non
         gen_segments = mock.Mock(return_value=[np.zeros(4, dtype=np.float32)])
     if document_chapters is None:
         document_chapters = chapters
-    with mock.patch.object(core, 'load_spacy'), \
+    # Stub preflight: this hermetic test has no real ffmpeg/espeak-ng (CI Windows lacks both),
+    # and run_checks() would abort main() before the logic under test. See _drive_main_backend.
+    from audiblez import doctor as _doctor
+    with mock.patch.object(_doctor, 'run_checks', return_value=[]), \
+         mock.patch.object(core, 'load_spacy'), \
          mock.patch.object(core, 'epub') as ep, \
          mock.patch.object(core, 'extract_book_metadata', return_value=('Title', 'Author')), \
          mock.patch.object(core, 'find_cover', return_value=None), \
