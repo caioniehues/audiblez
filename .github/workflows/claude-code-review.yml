@@ -12,10 +12,11 @@ on:
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
+    # Skip draft PRs: a review (and its token cost) on every push to an in-progress draft is noise.
+    # Drafts get reviewed once marked ready-for-review (which is in the trigger types above).
+    if: github.event.pull_request.draft == false
+    # Optional: also filter by PR author
     #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: ubuntu-latest

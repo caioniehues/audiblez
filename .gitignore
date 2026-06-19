@@ -25,3 +25,6 @@ dist
 
 # Compound Engineering local config (machine-local, not committed)
 .compound-engineering/*.local.yaml
+
+# planning-with-files scaffold (local working memory, never committed)
+.planning/
