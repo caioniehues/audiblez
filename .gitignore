@@ -7,6 +7,9 @@ chapters.txt
 *.wav
 *.mp3
 *.epub
+# Exception: the tiny in-repo e2e fixture must be committed so CI's
+# "create audiobook" step has an EPUB in a fresh clone (see git-clone-and-run.yml).
+!test/poe.epub
 *.sh
 *.json
 *.onnx
