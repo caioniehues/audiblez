@@ -289,17 +289,27 @@ class MainWindow(wx.Frame):
         engine_radio_panel = wx.Panel(panel)
         engine_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
         engine_radio_panel.SetSizer(engine_radio_panel_sizer)
+        # Render one radio per engine_choices() entry: the available backends are selectable;
+        # MOSS, when not fully installed, is shown DISABLED with its reason ("MOSS (unavailable —
+        # missing binary)") rather than silently hidden (PRD slice 1 / #7). The first choice is
+        # always 'cpu' (always available), so the RB_GROUP anchor is never the disabled MOSS radio,
+        # and the default selection comes from default_backend() (never the disabled radio).
         self.backend_radios = {}
-        avail = backends.available_backends()
+        choices = backends.engine_choices()
         default = backends.default_backend()
         self.selected_backend = default
-        for idx, bid in enumerate(avail):
+        for idx, choice in enumerate(choices):
             style = wx.RB_GROUP if idx == 0 else 0
-            rb = wx.RadioButton(engine_radio_panel, label=backends.BACKENDS[bid].label, style=style)
-            rb.Bind(wx.EVT_RADIOBUTTON, lambda event, b=bid: setattr(self, 'selected_backend', b))
-            if bid == default:
+            label = (choice.label if choice.available
+                     else f'{choice.label} (unavailable — {choice.reason})')
+            rb = wx.RadioButton(engine_radio_panel, label=label, style=style)
+            if choice.available:
+                rb.Bind(wx.EVT_RADIOBUTTON, lambda event, b=choice.id: self.on_select_backend(b))
+            else:
+                rb.Disable()  # present-but-disabled: visible, not selectable
+            if choice.id == default:
                 rb.SetValue(True)
-            self.backend_radios[bid] = rb
+            self.backend_radios[choice.id] = rb
             engine_radio_panel_sizer.Add(rb, 0, wx.ALL, 5)
         sizer.Add(engine_label, pos=(0, 0), flag=wx.ALL, border=border)
         sizer.Add(engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
@@ -325,10 +335,12 @@ class MainWindow(wx.Frame):
             for v in sorted(vlist, key=lambda x: (grade_rank(VOICE_QUALITY.get(x, '')), x)):
                 add_voice_choice(f'{flags[code]} {voice_with_grade(v)}', v)
 
-        voice_label = wx.StaticText(panel, label="Voice:")
+        self.voice_label = voice_label = wx.StaticText(panel, label="Voice:")
         self.selected_voice = DEFAULT_VOICE
         default_label = next(lbl for lbl, spec in self.voice_label_to_spec.items() if spec == DEFAULT_VOICE)
-        voice_dropdown = wx.ComboBox(panel, choices=voice_choices, value=default_label)
+        # Keep a handle: under the MOSS engine this dropdown is greyed out (MOSS ignores the
+        # Kokoro voice — slice 2 / #8), re-enabled when switching back to a Kokoro backend.
+        self.voice_dropdown = voice_dropdown = wx.ComboBox(panel, choices=voice_choices, value=default_label)
         voice_dropdown.Bind(wx.EVT_COMBOBOX, self.on_select_voice)
         voice_dropdown.Bind(wx.EVT_TEXT, self.on_select_voice)  # catch typed custom blends too
         audition_button = wx.Button(panel, label="🗣️ Audition voice")
@@ -359,6 +371,29 @@ class MainWindow(wx.Frame):
         sizer.Add(output_folder_label, pos=(3, 0), flag=wx.ALL, border=border)
         sizer.Add(self.output_folder_text_ctrl, pos=(3, 1), flag=wx.ALL | wx.EXPAND, border=border)
         sizer.Add(output_folder_button, pos=(4, 1), flag=wx.ALL, border=border)
+
+        # MOSS-only Clone voice control (slice 3 / #9): pick a reference WAV to narrate the whole
+        # book in that voice, or leave empty for MOSS's built-in voice. Built always (so engine
+        # switching only Show/Hide-s it — no layout rebuild) and revealed by _sync_engine_controls
+        # only when the llamacpp engine is selected. Disabled with a reason when the MOSS encoder
+        # GGUF is absent (cloning requires it).
+        self.clone_ref = None  # absolute path to the reference WAV, or None for built-in voice
+        self.clone_label = wx.StaticText(panel, label="Clone voice:")
+        self.clone_value = wx.StaticText(panel, label="Built-in voice")
+        self.clone_choose_button = wx.Button(panel, label="🎙️ Choose reference…")
+        self.clone_choose_button.Bind(wx.EVT_BUTTON, self.on_choose_clone_ref)
+        self.clone_clear_button = wx.Button(panel, label="✖ Clear")
+        self.clone_clear_button.Bind(wx.EVT_BUTTON, self.on_clear_clone_ref)
+        sizer.Add(self.clone_label, pos=(5, 0), flag=wx.ALL, border=border)
+        sizer.Add(self.clone_value, pos=(5, 1), flag=wx.ALL | wx.ALIGN_CENTER_VERTICAL, border=border)
+        sizer.Add(self.clone_choose_button, pos=(5, 2), flag=wx.ALL, border=border)
+        sizer.Add(self.clone_clear_button, pos=(5, 3), flag=wx.ALL, border=border)
+        self._clone_widgets = (self.clone_label, self.clone_value,
+                               self.clone_choose_button, self.clone_clear_button)
+
+        # Set the initial enabled/shown state to match the default engine (Kokoro unless MOSS is
+        # fully installed): greys the voice dropdown + reveals the clone control only under MOSS.
+        self._sync_engine_controls()
 
     def create_synthesis_panel(self):
         # Think and identify layout issue with the folling code
@@ -427,6 +462,89 @@ class MainWindow(wx.Frame):
     def on_select_speed(self, event):
         self.selected_speed = event.GetValue()  # SpinCtrlDouble -> bounded float
         print('Selected speed', self.selected_speed)
+
+    def on_select_backend(self, backend_id):
+        """Record the chosen engine and resync the engine-dependent controls.
+
+        Bound to each *available* engine radio. Speed is intentionally NOT touched — it stays
+        live under every engine (MOSS applies it downstream via atempo)."""
+        self.selected_backend = backend_id
+        self._sync_engine_controls()
+
+    def _is_moss_engine(self):
+        return backends.BACKENDS[getattr(self, 'selected_backend', 'cpu')].engine == 'llamacpp'
+
+    def _sync_engine_controls(self):
+        """Make the voice + clone controls match the selected engine (slices 2 & 3 / #8, #9).
+
+        Under MOSS (engine 'llamacpp'): grey the Kokoro voice dropdown — MOSS ignores it — and
+        reveal the Clone voice control (disabled with a reason when the encoder GGUF is absent).
+        Under any Kokoro backend: re-enable the dropdown and hide the clone control. The dropdown
+        never vanishes (no layout reshuffle); only the clone row is shown/hidden."""
+        moss = self._is_moss_engine()
+        # Voice dropdown: greyed under MOSS with an explanatory label (slice 2).
+        self.voice_dropdown.Enable(not moss)
+        self.voice_label.SetLabel("Voice (MOSS built-in):" if moss else "Voice:")
+        self.voice_dropdown.SetToolTip(
+            "MOSS uses its built-in voice — set a Clone reference to change it." if moss else "")
+        # Clone control: shown only under MOSS; gated on the encoder GGUF (slice 3).
+        encoder_present = backends.moss_paths().get('encoder') is not None
+        for w in self._clone_widgets:
+            w.Show(moss)
+        if moss:
+            self.clone_choose_button.Enable(encoder_present)
+            self.clone_clear_button.Enable(encoder_present and self.clone_ref is not None)
+            if not encoder_present:
+                self.clone_value.SetLabel("Cloning unavailable — missing MOSS encoder model")
+            else:
+                self._refresh_clone_value()
+        self.params_panel.Layout()
+
+    def _refresh_clone_value(self):
+        """Update the clone-selection display + Clear-button state from self.clone_ref."""
+        if self.clone_ref:
+            self.clone_value.SetLabel(os.path.basename(self.clone_ref))
+        else:
+            self.clone_value.SetLabel("Built-in voice")
+        self.clone_clear_button.Enable(self.clone_ref is not None)
+
+    def on_choose_clone_ref(self, event):
+        """Pick a reference WAV via a file dialog, with up-front validation (slice 3 / #9).
+
+        Light validation only (exists + readable WAV header) so a bad pick raises a clean dialog
+        now instead of a deep traceback hours into a render; deeper checks defer to synth time."""
+        with wx.FileDialog(self, "Choose a reference WAV to clone", wildcard="WAV files (*.wav)|*.wav",
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return
+            path = dialog.GetPath()
+        try:
+            self._validate_clone_ref(path)
+        except Exception as e:
+            wx.MessageBox(f"Not a usable reference WAV:\n{e}", "Invalid clone reference",
+                          wx.OK | wx.ICON_ERROR)
+            return
+        self.clone_ref = os.path.abspath(path)
+        self._refresh_clone_value()
+
+    @staticmethod
+    def _validate_clone_ref(path):
+        """Raise (with a human message) unless ``path`` is an existing, readable WAV header."""
+        if not os.path.isfile(path):
+            raise FileNotFoundError("file does not exist")
+        # soundfile reads only the header in info() — cheap, and it rejects non-WAV/corrupt files.
+        info = soundfile.info(path)
+        if info.frames <= 0:
+            raise ValueError("file contains no audio frames")
+
+    def on_clear_clone_ref(self, event):
+        """Revert to MOSS's built-in voice."""
+        self.clone_ref = None
+        self._refresh_clone_value()
+
+    def get_selected_clone_ref(self):
+        """The active clone reference: only meaningful under MOSS (Kokoro ignores it)."""
+        return self.clone_ref if self._is_moss_engine() else None
 
     def open_epub(self, file_path):
         # Cleanup previous layout (and the first-run hint) before (re)building.
@@ -534,14 +652,16 @@ class MainWindow(wx.Frame):
     def get_selected_speed(self):
         return float(self.selected_speed)
 
-    def _spawn_player(self, button, idle_label, produce_path):
+    def _spawn_player(self, button, idle_label, produce_path, busy_label="⏳"):
         """Run produce_path(core) -> wav path on a daemon thread, ffplay it, then clean up.
 
         Shared by chapter preview, voice audition, and the book trailer so the off-UI
         thread machinery (never join() on the UI thread — it freezes the GUI) lives once.
         produce_path returns a path to a temporary wav to play, or None to skip.
-        """
-        button.SetLabel("⏳")
+
+        ``busy_label`` shows while working; the MOSS callers pass a "loading model" variant for
+        the first (cold) call so the seconds-long resident-child warm-up doesn't look like a hang."""
+        button.SetLabel(busy_label)
         button.Disable()
 
         def restore():
@@ -571,16 +691,20 @@ class MainWindow(wx.Frame):
         thread.start()
         self.preview_threads.append(thread)
 
-    def _cached_synth(self, core, voice, backend):
+    def _cached_synth(self, core, voice, backend, clone_ref=None):
         """Reuse the built synthesizer across preview/audition clicks; building one reloads
         the whole Kokoro model (seconds + GPU memory) — for MOSS it spawns a resident child,
         so the cold start (~2.7s) is paid once per GUI session. Rebuild only when voice/backend
         change, and tear down the PREVIOUS engine first so a MOSS child isn't orphaned (it
-        holds ~8 GB of VRAM) when the user switches voice/backend."""
-        key = (voice, backend)
+        holds ~8 GB of VRAM) when the user switches voice/backend.
+
+        ``clone_ref`` is part of the cache key (slice 3 / #9): changing the clone reference must
+        tear down the stale MOSS child and respawn it encoding the NEW reference, else audition
+        would replay the previous voice — a silent-wrongness the audition must not commit."""
+        key = (voice, backend, clone_ref)
         if getattr(self, '_synth_cache_key', None) != key:
             self._close_cached_synth()
-            self._synth = core.build_synthesizer(voice, backend)
+            self._synth = core.build_synthesizer(voice, backend, clone_ref=clone_ref)
             self._synth_cache_key = key
         return self._synth
 
@@ -595,7 +719,8 @@ class MainWindow(wx.Frame):
     def _synth_to_temp(self, core, text, voice, speed):
         """Synthesize text to a temp wav and return its path (or None if no audio)."""
         backend = getattr(self, 'selected_backend', 'cpu')
-        synth = self._cached_synth(core, voice, backend)
+        clone_ref = self.get_selected_clone_ref()  # None unless MOSS + a reference chosen
+        synth = self._cached_synth(core, voice, backend, clone_ref=clone_ref)
         core.load_spacy()
         audio_segments = core.gen_audio_segments(synth, text, voice=voice, speed=speed)
         if not audio_segments:
@@ -634,7 +759,17 @@ class MainWindow(wx.Frame):
             return
         voice, speed = self.get_selected_voice(), self.get_selected_speed()
         self._spawn_player(button, "🗣️ Audition voice",
-                           lambda core: self._synth_to_temp(core, text, voice, speed))
+                           lambda core: self._synth_to_temp(core, text, voice, speed),
+                           busy_label=self._audition_busy_label(voice))
+
+    def _audition_busy_label(self, voice):
+        """"⏳ loading model…" when the upcoming MOSS audition will pay the cold-start child
+        spawn (no warm synth for this exact voice/backend/clone_ref), else a plain "⏳"."""
+        if not self._is_moss_engine():
+            return "⏳"
+        key = (voice, self.selected_backend, self.get_selected_clone_ref())
+        warm = getattr(self, '_synth_cache_key', None) == key
+        return "⏳" if warm else "⏳ loading model…"
 
     def on_preview_book_trailer(self, event):
         # Render a short sampler of every selected chapter's opening before committing.
@@ -642,6 +777,7 @@ class MainWindow(wx.Frame):
         file_path = self.selected_file_path
         voice, speed = self.get_selected_voice(), self.get_selected_speed()
         backend = getattr(self, 'selected_backend', 'cpu')
+        clone_ref = self.get_selected_clone_ref()  # MOSS clone (None for Kokoro/built-in)
         selected = [c for c in self.document_chapters if getattr(c, 'is_selected', False)] or None
         # Read on the UI thread; pass the SAME folder the lexicon editor saves to, so the
         # trailer auditions this book's edited pronunciations (not an empty cwd lexicon).
@@ -652,7 +788,8 @@ class MainWindow(wx.Frame):
             fd, name = tempfile.mkstemp(suffix='.wav')
             os.close(fd)
             result = core.make_trailer(file_path, voice, name, speed=speed, backend=backend,
-                                       selected_chapters=selected, output_folder=output_folder)
+                                       selected_chapters=selected, output_folder=output_folder,
+                                       clone_ref=clone_ref)
             if not result:
                 try:
                     os.unlink(name)
@@ -718,7 +855,8 @@ class MainWindow(wx.Frame):
         self.core_thread = CoreThread(params=dict(
             file_path=file_path, voice=voice, pick_manually=False, speed=speed,
             output_folder=self.output_folder_text_ctrl.GetValue(),
-            selected_chapters=selected_chapters, backend=self.selected_backend))
+            selected_chapters=selected_chapters, backend=self.selected_backend,
+            clone_ref=self.get_selected_clone_ref()))  # MOSS voice clone (None for Kokoro/built-in)
         self.core_thread.start()
 
     def on_open(self, event):

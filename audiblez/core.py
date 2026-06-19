@@ -83,6 +83,14 @@ MOSS_DECODER_GGUF = 'moss_tts_audio_decoder_f16.gguf'
 MOSS_ENCODER_GGUF = 'moss_tts_audio_encoder_f16.gguf'   # only for voice cloning (Phase-2)
 
 MOSS_SEED = 42                        # pinned: the cache key must be stable across runs
+# Cache-key sentinel for the MOSS *voice* axis when there is NO clone reference. MOSS ignores the
+# Kokoro voice, but the GUI's greyed voice dropdown still holds *some* Kokoro voice string; folding
+# that inert string into the cache key would fragment the sentence cache by whatever voice happened
+# to be selected (slice 2 / #8). Substituting this fixed constant keeps the MOSS-built-in-voice key
+# stable regardless of the dropdown. A clone reference still takes precedence (folded via
+# backends.clone_voice_id), so two different references never collide. NOT a Kokoro voice id and not
+# a 'clone:' id, so it can never alias either.
+MOSS_DEFAULT_VOICE = 'moss-builtin'
 # The six sampling params, pinned to fixed defaults (ADR 0005). SINGLE source: alias the
 # import-light backends copy so the synth request, the cache key (_moss_sampling_sig), and
 # doctor can never drift to two different dicts. Order is irrelevant — the cache fingerprints
@@ -338,8 +346,13 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
       # Resolve the spec's language code once for the whole run and thread it into each
       # gen_audio_segments call, instead of re-parsing the spec per chapter.
       lang_code = voicelib.voice_lang_code(voice)
+      # Coarse-chunk mode is MOSS-only (Kokoro re-splits internally, so it would be a no-op there).
+      # Gate it on the engine HERE so gen_audio_segments just honors a clean bool (build_synthesizer
+      # already warned if --coarse was passed for a non-MOSS backend).
+      coarse_effective = coarse and backends.BACKENDS[backend].engine == 'llamacpp'
       render_signature = _render_signature(book_lexicon, speed, precision,
-                                           backend=backend, clone_ref=clone_ref)
+                                           backend=backend, clone_ref=clone_ref,
+                                           coarse=coarse_effective)
       for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
@@ -384,7 +397,8 @@ def main(file_path: str, voice: str, pick_manually: bool, speed: float, output_f
         audio_segments = gen_audio_segments(
             synth, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences,
             chapter_label=f'chapter {i}', dead_letter_path=dead_letter_path,
-            cache=synth_cache, cache_key_fields=cache_fields, lang_code=lang_code)
+            cache=synth_cache, cache_key_fields=cache_fields, lang_code=lang_code,
+            coarse=coarse_effective)
         if audio_segments:
             final_audio = np.concatenate(audio_segments)
             soundfile.write(chapter_wav_path, final_audio, sample_rate)
@@ -551,14 +565,15 @@ def build_synthesizer(voice=None, backend: str = 'cpu', precision: str = 'fp32',
         params = SynthParams(voice=voice, backend=backend, precision=precision, clone_ref=clone_ref)
     voice, backend, precision, clone_ref = (
         params.voice, params.backend, params.precision, params.clone_ref)
-    if getattr(params, 'coarse', False):
-        # The coarse-chunk synth path (chunking.pack_chunks) is not wired yet — accept the flag
-        # but don't silently imply the speedup happened. Warn rather than pretend (no-op promise).
-        print('\033[93mWarning: --coarse is accepted but not yet wired; synthesizing at normal '
-              'sentence granularity (no speed gain yet).\033[0m')
     if backend not in backends.BACKENDS:
         raise ValueError(f'Unknown backend {backend!r}; choose from {backends.BACKEND_IDS}')
     info = backends.BACKENDS[backend]
+    if getattr(params, 'coarse', False) and info.engine != 'llamacpp':
+        # Coarse-chunk mode is a MOSS (llamacpp) fast path: paragraphs go to the engine as one
+        # utterance. Kokoro re-splits internally, so coarse is a no-op there — warn instead of
+        # silently implying a speedup. For MOSS the flag IS wired (see gen_audio_segments).
+        print('\033[93mWarning: --coarse only applies to the MOSS engine; '
+              'ignored for this backend (synthesizing at normal sentence granularity).\033[0m')
     if info.engine == 'llamacpp':
         # MOSS resident co-process: no espeak / Kokoro voice parsing — it owns its own g2p.
         # (`voice`/clone_ref select the narration; speed is applied downstream via atempo.)
@@ -1214,7 +1229,7 @@ def _cache_key_fields(backend, voice, speed, precision='fp32', clone_ref=None):
     """
     info = backends.BACKENDS[backend]
     if info.engine == 'llamacpp':
-        moss_voice = backends.clone_voice_id(clone_ref) if clone_ref else voice
+        moss_voice = backends.clone_voice_id(clone_ref) if clone_ref else MOSS_DEFAULT_VOICE
         return dict(engine='llamacpp', repo_id=backends.moss_repo_id(), voice=moss_voice,
                     speed=1.0,  # MOSS sentence cache is speed-agnostic (atempo applied later)
                     precision='fp32', max_sentence_length=MAX_SENTENCE_LENGTH,
@@ -1244,7 +1259,7 @@ def _split_into_sentences(doc, lang_code):
 def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None, post_event=None,
                        chapter_label=None, batch_max_chars=BATCH_MAX_CHARS,
                        synth_retries=SYNTH_RETRIES, dead_letter_path=None,
-                       cache=None, cache_key_fields=None, lang_code=None):
+                       cache=None, cache_key_fields=None, lang_code=None, coarse=False):
     nlp = load_spacy()
     audio_segments = []
     # build_synthesizer already parsed the spec; let it pass the resolved lang_code in to
@@ -1254,6 +1269,36 @@ def gen_audio_segments(synth, text, voice, speed, stats=None, max_sentences=None
     sentences = _split_into_sentences(nlp(text), lang_code)
     if max_sentences:
         sentences = sentences[:max_sentences]
+
+    if coarse:
+        # Opt-in coarse-chunk mode (ADR 0005, MOSS only — the caller gates this on the engine).
+        # Consecutive sentences are packed into utterance chunks capped at the correctness-
+        # validated 16.32 s (chunking.MAX_CHUNK_SECONDS), and each chunk is ONE MOSS request.
+        # The cache/failure/edit unit is the whole chunk: a chunk's joined text is its cache key
+        # (a multi-sentence chunk can't collide with a per-sentence entry — different text), and a
+        # failed chunk degrades to silence for the whole paragraph + one dead-letter. An oversize
+        # single sentence becomes its own chunk (pack_chunks never drops or sub-splits text).
+        from audiblez import chunking
+        from audiblez import cache as cache_mod
+        for chunk in chunking.pack_chunks(sentences):
+            chunk_text = ' '.join(chunk)
+            key = cache_mod.make_key(text=chunk_text, **(cache_key_fields or {})) if cache is not None else None
+            if cache is not None:
+                hit = cache.get(key)
+                if hit is not None:
+                    audio_segments.append(hit)
+                    _account(stats, len(chunk), len(chunk_text), 0.0, post_event, chapter_label)
+                    continue
+            t0 = time.time()
+            segs, failed = _synth_one_or_silence(synth, chunk_text, speed, synth_retries,
+                                                 chapter_label, dead_letter_path)
+            audio = np.concatenate(segs) if segs else np.zeros(0, dtype=np.float32)
+            # Never cache a failure or empty audio (would serve silence as a hit forever).
+            if cache is not None and not failed and audio.size > 0:
+                cache.put(key, audio)
+            audio_segments.append(audio)
+            _account(stats, len(chunk), len(chunk_text), time.time() - t0, post_event, chapter_label)
+        return audio_segments
 
     if cache is not None:
         # KEYSTONE slice 1: cache per sentence (the addressable unit). Misses are synthesized
@@ -1318,7 +1363,7 @@ def gen_text(text, voice='af_heart', output_file='text.wav', speed=1, play=False
 
 def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend='cpu',
                  sentences_per_chapter=TRAILER_SENTENCES_PER_CHAPTER, selected_chapters=None,
-                 max_chapters=None, precision='fp32', output_folder='.'):
+                 max_chapters=None, precision='fp32', output_folder='.', clone_ref=None):
     """Render a short audio sampler of a book: the opening sentences of each chapter.
 
     For each detected chapter, speaks a "Chapter N" label then its first
@@ -1340,7 +1385,7 @@ def make_trailer(file_path, voice, output_file='trailer.wav', speed=1.0, backend
     pieces, sampled = [], 0
     synth = None  # built inside the try so load_lexicon raising can't orphan the MOSS child
     try:
-        synth = build_synthesizer(voice, backend, precision=precision)
+        synth = build_synthesizer(voice, backend, precision=precision, clone_ref=clone_ref)
         # Same scope as seeding and the real run, so the trailer auditions the SAME pronunciations.
         book_lexicon = lexicon.load_lexicon(lexicon.lexicon_path(file_path, output_folder))
         for chapter in chapters:
@@ -1485,7 +1530,7 @@ def probe_duration(file_name):
         return None
 
 
-def _render_signature(book_lexicon, speed, precision, backend=None, clone_ref=None):
+def _render_signature(book_lexicon, speed, precision, backend=None, clone_ref=None, coarse=False):
     """Compact fingerprint of render-affecting inputs NOT already in the chapter filename.
 
     The wav filename encodes book stem, chapter index, and voice; this captures the rest
@@ -1506,8 +1551,13 @@ def _render_signature(book_lexicon, speed, precision, backend=None, clone_ref=No
     info = backends.BACKENDS.get(backend) if backend is not None else None
     if info is not None and info.engine == 'llamacpp':
         clone = f';clone={backends.clone_voice_id(clone_ref)}' if clone_ref else ''
+        # Coarse mode synthesizes a chunk as ONE utterance — materially different audio from the
+        # per-sentence concat — so it IS a render axis: a coarse/per-sentence toggle MUST bust the
+        # chapter wav on resume (story 11; the resume-by-skip landmine). Appended ONLY when coarse
+        # so existing per-sentence .sig files stay valid (no needless regeneration).
+        coarse_sig = ';coarse=1' if coarse else ''
         sig += (f';engine=llamacpp;repo={backends.moss_repo_id()}'
-                f';seed={MOSS_SEED};sampling={_moss_sampling_sig()}{clone}')
+                f';seed={MOSS_SEED};sampling={_moss_sampling_sig()}{clone}{coarse_sig}')
     return sig
 
 

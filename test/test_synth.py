@@ -612,7 +612,9 @@ class MossCacheFieldsTest(unittest.TestCase):
                 fb = core._cache_key_fields('moss', 'af_voice', 1.0, clone_ref=b.name)
                 ftext = core._cache_key_fields('moss', 'af_voice', 1.0)
         self.assertNotEqual(fa['voice'], fb['voice'])   # different clip -> different voice id
-        self.assertEqual(ftext['voice'], 'af_voice')    # text-only keeps the plain voice spec
+        # No clone ref -> the fixed MOSS_DEFAULT_VOICE sentinel, NOT the inert Kokoro voice spec
+        # (slice 2 / #8): MOSS ignores the Kokoro voice, so the key must not fragment on it.
+        self.assertEqual(ftext['voice'], core.MOSS_DEFAULT_VOICE)
 
 
 @unittest.skipIf(_ERR is not None, f"audiblez.core unavailable: {_ERR}")

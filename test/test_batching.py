@@ -258,5 +258,78 @@ class PackChunksPropertyTest(unittest.TestCase):
                 self.assertEqual(pack_chunks([], max_seconds=cap), [])
 
 
+@unittest.skipIf(_ERR is not None or _CHUNKING_ERR is not None,
+                 "audiblez.core/chunking unavailable")
+class GenAudioSegmentsCoarseTest(unittest.TestCase):
+    """The coarse-chunk synth path in gen_audio_segments (issue #2 stories 22-25 / ADR 0005).
+
+    Coarse mode sends each packed chunk to the engine as ONE request (vs per-sentence), caches /
+    fails / edits at chunk granularity. The synth + spaCy are faked, so no model/audio is needed.
+    """
+    import numpy as np  # core is importable here (guarded), so numpy is present
+
+    def _fake_nlp(self):
+        return lambda text: SimpleNamespace(sents=[SimpleNamespace(text=s) for s in text.split('|')])
+
+    def _recording_synth(self, calls):
+        # One MOSS request per call; returns a 1-frame float32 array so np.concatenate works.
+        def synth(text, sp):
+            calls.append(text)
+            return [self.np.zeros(1, dtype=self.np.float32)]
+        return synth
+
+    def test_short_sentences_become_one_chunk_one_request(self):
+        # All under the cap -> a single chunk -> ONE request, joined (NOT \n\n\n-batched).
+        calls = []
+        with mock.patch.object(core, 'load_spacy', return_value=self._fake_nlp()):
+            out = core.gen_audio_segments(self._recording_synth(calls), 'one|two|three',
+                                          voice='af_sky', speed=1.0, coarse=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], 'one two three')
+        self.assertNotIn('\n\n\n', calls[0])
+        self.assertEqual(len(out), 1)
+
+    def test_oversize_sentence_is_its_own_chunk(self):
+        # A sentence over the cap forces chunk boundaries; pack_chunks never drops/sub-splits it.
+        big = 'x' * (int(MAX_CHUNK_SECONDS / EST_SECS_PER_CHAR) + 50)
+        calls = []
+        with mock.patch.object(core, 'load_spacy', return_value=self._fake_nlp()):
+            core.gen_audio_segments(self._recording_synth(calls), f'small|{big}|tail',
+                                    voice='af_sky', speed=1.0, coarse=True)
+        self.assertEqual(calls, ['small', big, 'tail'])  # 3 chunks, text intact
+
+    def test_failed_chunk_splices_silence_and_dead_letters(self):
+        import os
+        import tempfile
+        def boom(text, sp):
+            raise RuntimeError('synth boom')
+        with tempfile.TemporaryDirectory() as tmp:
+            dl = os.path.join(tmp, 'c.failed.jsonl')
+            with mock.patch.object(core, 'load_spacy', return_value=self._fake_nlp()):
+                out = core.gen_audio_segments(boom, 'one|two', voice='af_sky', speed=1.0,
+                                              coarse=True, synth_retries=0, dead_letter_path=dl)
+            self.assertEqual(len(out), 1)          # one chunk -> one (silence) segment
+            self.assertGreater(out[0].size, 0)     # silence spliced, not empty
+            with open(dl) as f:
+                self.assertEqual(sum(1 for _ in f), 1)  # exactly one dead-letter for the chunk
+
+    def test_rerun_serves_chunk_from_cache(self):
+        from audiblez import cache as cache_mod
+        import tempfile
+        fields = core._cache_key_fields('moss', 'af_sky', 1.0)  # llamacpp cache fields
+        with tempfile.TemporaryDirectory() as tmp:
+            c = cache_mod.SynthCache(tmp)
+            first = []
+            with mock.patch.object(core, 'load_spacy', return_value=self._fake_nlp()):
+                core.gen_audio_segments(self._recording_synth(first), 'one|two', voice='af_sky',
+                                        speed=1.0, coarse=True, cache=c, cache_key_fields=fields)
+            self.assertEqual(len(first), 1)  # one chunk synthesized + cached
+            second = []
+            with mock.patch.object(core, 'load_spacy', return_value=self._fake_nlp()):
+                core.gen_audio_segments(self._recording_synth(second), 'one|two', voice='af_sky',
+                                        speed=1.0, coarse=True, cache=c, cache_key_fields=fields)
+            self.assertEqual(len(second), 0)  # re-run fully served from cache (0 new requests)
+
+
 if __name__ == '__main__':
     unittest.main()

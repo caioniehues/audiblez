@@ -105,9 +105,10 @@ def cli_main():
                         help='Reference WAV for zero-shot voice cloning (MOSS engine only). The '
                              'audiobook is narrated in the reference voice; encoded once at start.')
     parser.add_argument('--coarse', default=False, action='store_true',
-                        help='(EXPERIMENTAL, not yet wired) Opt-in coarse-chunk mode (MOSS engine): '
-                             'intended to synthesize a paragraph as one utterance for more speed. '
-                             'Currently a no-op — accepted but synthesis stays sentence-level.')
+                        help='(EXPERIMENTAL, MOSS engine only) Opt-in coarse-chunk mode: pack '
+                             'consecutive sentences into one utterance (capped at ~16 s) for more '
+                             'speed, at the cost of sentence-level edit/cache granularity. Ignored '
+                             'for non-MOSS backends. Audition the output — verify quality by ear.')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -237,7 +238,8 @@ def cli_main():
         from audiblez.core import make_trailer
         out = os.path.join(args.output, 'trailer.wav')
         result = make_trailer(args.epub_file_path, args.voice, out, speed=args.speed, backend=backend,
-                              precision=args.precision, output_folder=args.output)
+                              precision=args.precision, output_folder=args.output,
+                              clone_ref=args.clone_ref)
         sys.exit(0 if result else 1)
 
     if args.precision != 'fp32':

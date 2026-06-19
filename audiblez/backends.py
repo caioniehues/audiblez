@@ -177,6 +177,56 @@ def moss_status() -> str:
     return 'absent'
 
 
+@dataclass(frozen=True)
+class EngineChoice:
+    """One selectable engine for a UI selector: its backend id, label, and availability.
+
+    ``available`` is False for an engine that is *known about* but not usable right now (today
+    only a half-installed MOSS); ``reason`` is then a non-empty human explanation and is '' when
+    available. The GUI renders one radio per choice, disabling the unavailable ones with the
+    reason rather than silently hiding them (PRD stories 3/4).
+    """
+    id: str          # backend id ('cpu' | 'rocm' | 'moss' | ...)
+    label: str       # display label (BackendInfo.label)
+    available: bool  # selectable on this machine right now
+    reason: str      # '' when available; why-unavailable text otherwise
+
+
+def _moss_unavailable_reason() -> str:
+    """Non-empty, human reason MOSS isn't selectable, from which piece :func:`moss_paths` lacks.
+
+    Distinguishes a missing binary from a missing required GGUF (the two ``partial`` causes the
+    PRD calls out) so the disabled radio tells the user *what to fix*. ``moss_status`` alone
+    only says present/partial/absent, so the granular reason is derived here.
+    """
+    paths = moss_paths()
+    missing = []
+    if paths['binary'] is None:
+        missing.append('binary')
+    if any(paths[k] is None for k in MOSS_REQUIRED):
+        missing.append('model')
+    if not missing:  # defensive: shouldn't happen (caller only asks when not 'present')
+        return 'not available'
+    return 'missing ' + ' and '.join(missing)
+
+
+def engine_choices() -> list['EngineChoice']:
+    """Ordered engines to surface in a selector, each flagged available / disabled-with-reason.
+
+    Every backend in :func:`available_backends` is returned ``available=True`` in display order;
+    MOSS, when not fully installed (``moss_status() != 'present'``, so it is absent from
+    ``available_backends``), is appended **present-but-disabled** with a human reason instead of
+    being omitted — replacing the GUI's old silent-hide. This is purely an additive presentation
+    seam: :func:`available_backends` / :func:`default_backend` semantics are unchanged (Kokoro
+    stays the default), so the selector's default selection never lands on the disabled MOSS radio.
+    """
+    avail = available_backends()
+    choices = [EngineChoice(bid, BACKENDS[bid].label, True, '') for bid in avail]
+    if 'moss' not in avail:
+        choices.append(EngineChoice('moss', BACKENDS['moss'].label, False, _moss_unavailable_reason()))
+    return choices
+
+
 def _mlx_importable() -> bool:
     """True only on Apple Silicon with mlx-audio installed (no import side effects)."""
     return (platform.system() == 'Darwin'
