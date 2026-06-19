@@ -218,5 +218,19 @@ Implemented all 6 open GitHub issues (MOSS-into-GUI epic + Phase-2 backend remai
 | #2 | coarse-chunk mode now WIRED (was unwired stub): `gen_audio_segments(coarse=)` → `chunking.pack_chunks` @ 16.32s cap, per-chunk cache/failure unit, MOSS-gated in main; coarse folded into chapter `.sig` so a coarse↔per-sentence toggle busts resume (story 11); CLI help updated | 4 synth-path tests in test_batching.py + 2 `.sig` tests in test_cache.py; real-binary smoke = 1 request/chunk, 6.32s audio |
 | #5 | PRD umbrella — satisfied by #6/#7/#8/#9 | — |
 
-**Tests:** full suite 313 → **327 pass, 10 skipped**; ruff clean. **Not committed** (working tree, on `main`).
-**Pending (user gate):** by-ear GUI acceptance (no display in session) + coarse WER/quality (16.32s validated cap; 22s extension still gated).
+**Tests:** full suite 313 → **327 pass, 10 skipped**; ruff clean.
+
+**GUI control wiring verified on the live display (18/18 programmatic checks):** MOSS radio present+enabled;
+voice dropdown greys under MOSS + re-enables on switch-back; clone control shows/hides; WAV validation
+accepts a real wav + rejects a non-wav; clone_ref threads through under MOSS + is suppressed for Kokoro.
+
+**Committed:** branch `feat/moss-gui-integration`, commit `1017fcf` (9 files: backends/cli/core/ui + 4 test
+files + progress.md). NOT pushed; no PR. `.envrc` MOSS wiring is gitignored (local-only — re-add after a
+fresh clone). Pre-existing `tools/tts_ab.py` edit + untracked `CROSS_PROJECT_ANALYSIS.md` /
+`test/MOSS_TEST_AUDIT.md` left untouched (not part of this work).
+
+**Docs:** README "Choosing a backend" gained a MOSS row + a "MOSS — the higher-quality engine" subsection
+(install, `--clone-ref`, `--coarse`, GUI clone control); `--help` block updated for `-b moss` / `--clone-ref` / `--coarse`.
+
+**Still human-gated (irreducible):** by-ear AUDIO quality (does the MOSS/cloned voice sound right; coarse WER)
+— no display or automation can judge perception. 22s coarse cap stays gated on an on-box WER check (16.32s is the validated default).

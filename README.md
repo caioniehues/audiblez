@@ -161,16 +161,55 @@ By default audiblez runs on **CPU**. Use `-b/--backend` to pick a faster engine:
 | ROCm    | `-b rocm` | AMD GPU         | Linux only; requires a ROCm build of PyTorch                                |
 | MPS     | `-b mps`  | Apple Silicon   | PyTorch Metal backend                                                       |
 | MLX     | `-b mlx`  | Apple Silicon   | native Apple engine, fastest on Mac — needs `pip install "audiblez[mlx]"`   |
+| MOSS    | `-b moss` | GPU (llama.cpp) | higher-quality MOSS-TTS engine; needs the `llama-moss-tts` binary + GGUFs   |
 
 ```
 audiblez book.epub -v af_heart -b mlx     # Apple Silicon (fastest)
 audiblez book.epub -v af_heart -b cuda    # NVIDIA
 audiblez book.epub -v af_heart -b rocm    # AMD (Linux)
+audiblez book.epub -b moss                # higher-quality MOSS engine (voice picked by the engine)
 ```
 
 The GUI exposes the same choices as radio buttons — only the backends actually available on your
 machine are shown. If you request a backend that isn't available, audiblez warns and falls back to CPU.
 `--cuda` is still accepted as a deprecated alias for `-b cuda` (and maps to `-b rocm` on a ROCm build).
+
+### MOSS — the higher-quality engine
+
+**MOSS** (`-b moss`) is a higher-quality narration engine that runs as a resident `llama.cpp`
+co-process (AMD via Vulkan). When its binary and model weights are present it is **auto-selected as
+the default**; otherwise audiblez falls back to Kokoro. It is **not installed by default** — you need:
+
+- the patched `llama-moss-tts` binary on `PATH` (or set `AUDIBLEZ_MOSS_BIN=/path/to/llama-moss-tts`), and
+- the MOSS GGUF weights (backbone + decoder; the encoder is needed only for voice cloning), discovered
+  from `~/Projects/moss-work/gguf` or overridden via `AUDIBLEZ_MOSS_BACKBONE` / `_DECODER` / `_ENCODER`.
+
+Run `audiblez --doctor` to confirm MOSS is detected. MOSS ignores the Kokoro `-v` voice (it uses its
+own built-in voice unless you clone one) and ignores speed at synth time — `--speed` is applied
+afterwards by re-stretching, pitch-preserved.
+
+**Voice cloning (`--clone-ref`).** Narrate the whole book in a voice cloned from a short reference WAV:
+
+```
+audiblez book.epub -b moss --clone-ref my_voice.wav
+```
+
+The reference clip *is* the voice, so it enters the cache key — two different clips never reuse each
+other's audio. Cloning needs the MOSS encoder GGUF present.
+
+**Coarse-chunk mode (`--coarse`, experimental, MOSS only).** Pack consecutive sentences into one
+utterance (capped at ~16 s) so MOSS does fewer, larger requests — faster, at the cost of
+sentence-level edit/cache granularity. Ignored for non-MOSS backends. Audition the output: verify
+the quality by ear before committing a long run.
+
+```
+audiblez book.epub -b moss --coarse
+```
+
+**In the GUI**, MOSS shows up as an Engine radio (disabled, with the reason, when not fully
+installed). Selecting it greys out the Kokoro voice dropdown and reveals a **Clone voice** control:
+pick a reference WAV (or leave it for the built-in voice), then **Audition** to hear it — the first
+audition shows a "loading model" state while the co-process warms up.
 
 **Apple Silicon** is fully supported via both **MLX** (native, fastest — `pip install "audiblez[mlx]"`)
 and **MPS** (PyTorch Metal). On an M-series Mac, MLX narrates several times faster than CPU.
@@ -212,9 +251,10 @@ to `<chapter>.failed.jsonl`. The ETA is measured from real throughput (not a fla
 For all the options available, you can check the help page `audiblez --help`:
 
 ```
-usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-b {cpu,cuda,rocm,mps,mlx}] [-o FOLDER]
+usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-b {cpu,cuda,rocm,mps,mlx,moss}] [-o FOLDER]
                 [--doctor] [--deep] [--merge] [--trailer] [--seed-lexicon] [--cache]
                 [--cache-clear] [--tune] [--precision {fp32,fp16,bf16}]
+                [--clone-ref WAV] [--coarse]
                 [epub_file_path]
 
 positional arguments:
@@ -227,10 +267,11 @@ options:
                         am_deep), or a custom blend like 'af_bella:60,af_heart:40'.
   -p, --pick            Interactively select which chapters to read in the audiobook
   -s, --speed SPEED     Set speed from 0.5 to 2.0
-  -b, --backend {cpu,cuda,rocm,mps,mlx}
+  -b, --backend {cpu,cuda,rocm,mps,mlx,moss}
                         Narration backend: cpu, cuda (NVIDIA), rocm (AMD), mps
-                        (Apple Silicon), mlx (Apple Silicon native). Default: auto-select
-                        the best working backend (a GPU when usable, else CPU).
+                        (Apple Silicon), mlx (Apple Silicon native), moss (higher-quality
+                        llama.cpp engine). Default: auto-select the best working backend
+                        (MOSS when fully installed, else a GPU when usable, else CPU).
   -o, --output FOLDER   Output folder for the audiobook and temporary files
   --doctor              Run preflight checks (ffmpeg, espeak-ng, spaCy, backend) and exit
   --deep                With --doctor: also load the model and synthesize one word (slow)
@@ -242,6 +283,8 @@ options:
   --chapters CHAPTERS   Comma-separated list or N-M range of chapter indices to convert (e.g. '1,3,5' or '2-6')
   --chapter-text-dir DIR
                         Directory containing chapter_<i>.txt files that override the extracted chapter text
+  --clone-ref WAV       Reference WAV for zero-shot voice cloning (MOSS engine); narrate in that voice
+  --coarse              (EXPERIMENTAL, MOSS engine only) Pack sentences into ~16 s chunks for more speed
 
 examples:
   audiblez book.epub -v af_heart           # best-quality default voice
